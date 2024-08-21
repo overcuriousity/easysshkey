@@ -13,6 +13,12 @@ SSH Key Manager is a bash script designed to simplify the process of generating,
 - Interactive menu-driven interface
 - Colorized output for better readability
 
+## Future Features
+
+- Hardware Key Support
+- Password-Protected Keys
+- possibly Implementation in Python (with more Features) and publishing in AUR
+
 ## Requirements
 
 - Bash shell (version 4.0 or later recommended)
