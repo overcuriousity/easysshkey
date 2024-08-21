@@ -80,20 +80,23 @@ generate_ssh_key() {
     success "SSH key pair generated and configured successfully."
 }
 
-# Function to import private key
 import_private_key() {
+    local hosts=()
     local private_key_path=$(select_key_file "private" "$ssh_keys_location/id_rsa" "id_*" "false")
-    local remote_host=$(prompt_with_default "Enter remote host" "example.com")
-    local remote_user=$(prompt_with_default "Enter remote user" "$USER")
+    if [ $? -ne 0 ]; then
+        echo "Failed to select a valid private key. Exiting."
+        return 1
+    fi
     
     local key_name=$(basename "$private_key_path")
     local destination_path="$ssh_keys_location$key_name"
-
+    
     if [[ "$private_key_path" != "$destination_path" ]]; then
         cp -f "$private_key_path" "$destination_path"
+        cleanup_and_update_ssh_config
         echo "Private key copied to $destination_path"
     fi
-
+    
     chmod 600 "$destination_path"
     
     if [ ! -f "${destination_path}.pub" ]; then
@@ -101,11 +104,26 @@ import_private_key() {
         ssh-keygen -y -f "$destination_path" > "${destination_path}.pub"
         echo "Public key generated: ${destination_path}.pub"
     fi
-
-    configure_remote_ssh "$remote_user" "$remote_host"
-    configure_local_ssh "$key_name" "$remote_host" "$remote_user"
-    check_remote_ssh_config "$remote_user" "$remote_host" "$destination_path"
+    
+    if prompt_yes_no "Do you want to check the configuration for multiple remote hosts? (This is not strictly necessary when the remote hosts were properly configured before and the imported was already registered automatically. The check requires user interaction by entering each password multiple times for each host.)" "n"; then
+        while true; do
+            local host=$(prompt_with_default "Enter host (or press Enter to finish)" "")
+            if [ -z "$host" ]; then
+                break
+            fi
+            hosts+=("$host")
+        done
+        
+        for host in "${hosts[@]}"; do
+            local remote_user=$(prompt_with_default "Enter remote user for $host" "$USER")
+            
+            configure_remote_ssh "$remote_user" "$host"
+            configure_local_ssh "$key_name" "$host" "$remote_user"
+            check_remote_ssh_config "$remote_user" "$host" "$destination_path"
+        done
+    fi
 }
+
 
 select_key_file() {
     local key_type="$1"
@@ -126,13 +144,13 @@ select_key_file() {
 
     if [ ${#files[@]} -eq 0 ]; then
         echo "No $key_type keys found in ~/.ssh directory." >&2
-        selected_file=$(prompt_with_default "Enter path to $key_type key" "$default_path")
+        selected_file=$(prompt_with_default "Enter path to $key_type key" "")
     else
         echo "Select a $key_type key:" >&2
         select file in "${files[@]}" "Enter path manually"; do
             case $file in
                 "Enter path manually")
-                    selected_file=$(prompt_with_default "Enter path to $key_type key" "$default_path")
+                    selected_file=$(prompt_with_default "Enter path to $key_type key" "")
                     break
                     ;;
                 *)
@@ -252,72 +270,54 @@ configure_local_ssh() {
     local remote_user="$3"
     echo "Configuring local SSH to use the new key..."
 
-    #if prompt_yes_no "Would you like to update your SSH config to use this key for $remote_host? (Recommended)" "y"; then
-    #    cleanup_and_update_ssh_config "$key_name" "$remote_host" "$remote_user"
-    #fi
-
     # Set correct permissions for the private key file
     chmod 600 "$ssh_keys_location$key_name"
     # Set correct permissions for the public key file
     chmod 644 "$ssh_keys_location$key_name.pub"
 
+    cleanup_and_update_ssh_config 
+
     echo "SSH configuration complete."
 }
 
 cleanup_and_update_ssh_config() {
-    local new_key_name="$1"
-    local remote_host="$2"
-    local remote_user="$3"
     local ssh_config="$ssh_keys_location/config"
-    local wildcard_id="/id*"
 
     echo "Updating SSH config..."
-    #echo "Before modification:"
-    #cat "$ssh_config"
 
     # Create a temporary file
     local temp_config=$(mktemp)
 
-    # Process the config file
-    {
-        # Variable to track if we've seen the target host
-        local seen_target_host=false
+    # Write the Host * block
+    echo "Host *" > "$temp_config"
 
-        # Read the existing config file line by line
+    # Find all private key files and add them as IdentityFile entries
+    find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
+        echo "    IdentityFile $key_file" >> "$temp_config"
+    done
+
+    # Add a blank line for readability
+    echo "" >> "$temp_config"
+
+    # If the config file already exists, process its content
+    if [[ -f "$ssh_config" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
-            # Write the line to the new config
-            echo "$line"
-
-            # Check if this is the start of a Host block
-            if [[ "$line" =~ ^Host[[:space:]] ]]; then
-                # Extract the hostname
-                local current_host=$(echo "$line" | awk '{print $2}')
-
-                # If this is our target host, update the seen_target_host flag
-                if [[ "$current_host" == "$remote_host" ]]; then
-                    seen_target_host=true
-                    # Add or update the User and IdentityFile entries
-                    echo "    User $remote_user"
-                    echo "    IdentityFile $ssh_keys_location$wildcard_id"
+            if [[ "$line" =~ ^[[:space:]]*IdentityFile[[:space:]]+(.*) ]]; then
+                # Check if the IdentityFile exists
+                if [[ -f "${BASH_REMATCH[1]}" ]]; then
+                    echo "$line" >> "$temp_config"
                 fi
+            elif [[ "$line" != "Host *" ]]; then
+                # Keep all other lines except "Host *"
+                echo "$line" >> "$temp_config"
             fi
         done < "$ssh_config"
-
-        # If we haven't seen the target host, append it to the config
-        if ! $seen_target_host; then
-            echo ""
-            echo "Host $remote_host"
-            echo "    User $remote_user"
-            echo "    IdentityFile $ssh_keys_location$wildcard_id"
-        fi
-    } > "$temp_config"
+    fi
 
     # Replace the original file with the updated version
     mv "$temp_config" "$ssh_config"
     chmod 600 "$ssh_config"
 
-    #echo "After modification:"
-    #cat "$ssh_config"
     echo "SSH configuration update complete."
 }
 
@@ -370,6 +370,7 @@ check_local_ssh_security() {
         "X11 forwarding"
         "MaxAuthTries setting"
         "Privilege separation"
+        "Cleanup and Update SSH-config"
     )
     
     # Display checks and ask for confirmation
@@ -396,6 +397,7 @@ check_local_ssh_security() {
     check_x11_forwarding
     check_max_auth_tries
     check_privilege_separation
+    cleanup_and_update_ssh_config
     
     # Display results
     echo ""
@@ -533,6 +535,7 @@ fix_local_ssh_security() {
 
 # Main script
 while true; do
+    cleanup_and_update_ssh_config
     # Display menu
     echo -e "\n${GREEN}SSH Key Setup Script Menu${NC}"
     echo -e "${BLUE}═════════════════════════${NC}\n"
