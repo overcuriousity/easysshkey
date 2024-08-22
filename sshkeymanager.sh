@@ -56,47 +56,194 @@ prompt_yes_no() {
     done
 }
 
-# Function to generate SSH key
 generate_ssh_key() {
-    local remote_host=$(prompt_with_default "Enter remote host" "1.2.3.4")
-    local remote_user=$(prompt_with_default "Enter remote user" "$USER")
-    local key_algo=$(prompt_with_default "Enter key algorithm" "ed25519")
-    warn "The name you select for the key should begin with "id_*" to be compatible with this script!"
-    local key_name=$(prompt_with_default "Enter key name" "id_${key_algo}_$USER")
+    local key_type
+    local key_size
+    local key_name
+    local remote_host
+    local remote_user
+    local use_passphrase
+
+    echo -e "\n${GREEN}SSH Key Generation Menu${NC}"
+    echo -e "${BLUE}═════════════════════════${NC}\n"
+
+    # Key Type Selection
+    echo -e "${CYAN}Select Key Type:${NC}"
+    echo "1. Ed25519 (Recommended)"
+    echo "   + Advantages: Modern, secure, and fast"
+    echo "   - Disadvantages: Not supported on very old systems"
+    echo "2. RSA"
+    echo "   + Advantages: Widely compatible"
+    echo "   - Disadvantages: Slower than Ed25519 for equivalent security"
+    echo "3. ECDSA"
+    echo "   + Advantages: Good balance of security and speed"
+    echo "   - Disadvantages: Some organizations avoid due to potential backdoor concerns"
+    echo "4. FIDO2 Hardware Key (Ed25519-SK or ECDSA-SK)"
+    echo "   + Advantages: Enhanced security with hardware-backed keys"
+    echo "   - Disadvantages: Requires compatible hardware security key and libfido2 library"
     
+    while true; do
+        read -p "Enter your choice (1-4): " key_type_choice
+        case $key_type_choice in
+            1) key_type="ed25519"; break;;
+            2) key_type="rsa"; break;;
+            3) key_type="ecdsa"; break;;
+            4) 
+                echo -e "\n${CYAN}Select Hardware Key Type:${NC}"
+                echo "1. Ed25519-SK (Recommended if supported by your device)"
+                echo "2. ECDSA-SK (Better compatibility with older hardware keys)"
+                read -p "Enter your choice (1-2): " hw_key_choice
+                case $hw_key_choice in
+                    1) key_type="ed25519-sk"; break;;
+                    2) key_type="ecdsa-sk"; break;;
+                    *) echo "Invalid choice. Please try again.";;
+                esac
+                ;;
+            *) echo "Invalid choice. Please try again.";;
+        esac
+    done
+
+    # Key Size Selection (only for RSA and ECDSA)
+    if [ "$key_type" == "rsa" ] || [ "$key_type" == "ecdsa" ]; then
+        echo -e "\n${CYAN}Select Key Size:${NC}"
+        if [ "$key_type" == "rsa" ]; then
+            echo "1. 2048 bits (Minimum recommended)"
+            echo "2. 4096 bits (More secure, but slower)"
+        else  # ECDSA
+            echo "1. 256 bits (Recommended)"
+            echo "2. 384 bits (More secure, but slower)"
+            echo "3. 521 bits (Most secure, slowest)"
+        fi
+        
+        while true; do
+            read -p "Enter your choice: " key_size_choice
+            case $key_size_choice in
+                1) key_size=$([ "$key_type" == "rsa" ] && echo "2048" || echo "256"); break;;
+                2) key_size=$([ "$key_type" == "rsa" ] && echo "4096" || echo "384"); break;;
+                3) [ "$key_type" == "ecdsa" ] && { key_size="521"; break; } || echo "Invalid choice for RSA. Please try again.";;
+                *) echo "Invalid choice. Please try again.";;
+            esac
+        done
+    fi
+
+    # Passphrase Option
+    echo -e "\n${CYAN}Passphrase Option:${NC}"
+    echo "Using a passphrase adds an extra layer of security to your SSH key."
+    echo "+ Advantages: Protects the key if it's stolen or accessed by unauthorized users"
+    echo "- Disadvantages: You'll need to enter the passphrase each time you use the key (unless using ssh-agent)"
+    
+    if prompt_yes_no "Do you want to set a passphrase for your SSH key?" "y"; then
+        use_passphrase=true
+        echo "You will be prompted to enter the passphrase during key generation."
+    else
+        use_passphrase=false
+        echo "No passphrase will be set. Your key will not be password-protected."
+    fi
+
+    # Key Name
+    echo -e "\n${CYAN}Enter Key Name:${NC}"
+    warn "The name should begin with 'id_' to be compatible with this script."
+    echo "Example: id_${key_type}_username"
+    while true; do
+        read -p "Key name: " key_name
+        if [[ $key_name == id_* ]]; then
+            break
+        else
+            echo "Key name must start with 'id_'. Please try again."
+        fi
+    done
+
+    # Remote Host and User
+    remote_host=$(prompt_with_default "Enter remote host" "1.2.3.4")
+    remote_user=$(prompt_with_default "Enter remote user" "$USER")
+
+    # Generate the key
     info "Generating new SSH key pair..."
-    ssh-keygen -t "$key_algo" -f "$ssh_keys_location$key_name" -N ""
+    if [[ "$key_type" == *"-sk" ]]; then
+        echo "Please insert your hardware security key and follow any prompts."
+        if [ "$use_passphrase" = true ]; then
+            if ! ssh-keygen -t $key_type -f "$ssh_keys_location$key_name"; then
+                echo -e "\n${RED}Error:${NC} Failed to generate hardware-backed key. This might be due to missing libfido2 library."
+                echo "For Debian-based systems, try installing it with:"
+                echo "sudo apt update && sudo apt install libfido2-1"
+                echo "For Arch-based systems, use:"
+                echo "sudo pacman -Sy libfido2"
+                echo "After installing, please try again."
+                return 1
+            fi
+        else
+            if ! ssh-keygen -t $key_type -f "$ssh_keys_location$key_name" -N ""; then
+                echo -e "\n${RED}Error:${NC} Failed to generate hardware-backed key. This might be due to missing libfido2 library."
+                echo "For Debian-based systems, try installing it with:"
+                echo "sudo apt update && sudo apt install libfido2-1"
+                echo "For Arch-based systems, use:"
+                echo "sudo pacman -Sy libfido2"
+                echo "After installing, please try again."
+                return 1
+            fi
+        fi
+    elif [ "$key_type" == "ed25519" ]; then
+        if [ "$use_passphrase" = true ]; then
+            ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name"
+        else
+            ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name" -N ""
+        fi
+    else
+        if [ "$use_passphrase" = true ]; then
+            ssh-keygen -t $key_type -b $key_size -f "$ssh_keys_location$key_name"
+        else
+            ssh-keygen -t $key_type -b $key_size -f "$ssh_keys_location$key_name" -N ""
+        fi
+    fi
+
     chmod 600 "$ssh_keys_location$key_name"
     chmod 644 "$ssh_keys_location$key_name.pub"
-    
+
+    # Copy the key to the remote host
     info "Copying $ssh_keys_location$key_name.pub to $remote_host..."
-    echo "Running ssh-copy-id -f -i "$ssh_keys_location$key_name.pub" "$remote_user@$remote_host""
+    echo "Running ssh-copy-id -f -i \"$ssh_keys_location$key_name.pub\" \"$remote_user@$remote_host\""
     ssh-copy-id -f -i "$ssh_keys_location$key_name.pub" "$remote_user@$remote_host"
-    
+
+    # Configure SSH
     configure_remote_ssh "$remote_user" "$remote_host"
     configure_local_ssh "$key_name" "$remote_host" "$remote_user"
     check_remote_ssh_config "$remote_user" "$remote_host" "$ssh_keys_location$key_name"
-    
+
     success "SSH key pair generated and configured successfully."
+
+    if [[ "$key_type" == *"-sk" ]]; then
+        echo -e "\n${YELLOW}Note:${NC} You've generated a hardware-backed SSH key. Remember to have your security key available when using this SSH key."
+    fi
+
+    if [ "$use_passphrase" = true ]; then
+        echo -e "\n${YELLOW}Note:${NC} You've set a passphrase for your SSH key. Remember to enter this passphrase when using the key, or consider using ssh-agent to manage your keys."
+    else
+        echo -e "\n${YELLOW}Note:${NC} Your SSH key is not protected by a passphrase. Ensure you keep the private key secure."
+    fi
+    if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
+        check_local_ssh_security
+    fi
 }
 
 import_private_key() {
     local hosts=()
+    local key_name
+    local destination_path
+
     local private_key_path=$(select_key_file "private" "$ssh_keys_location/id_rsa" "id_*" "false")
     if [ $? -ne 0 ]; then
         echo "Failed to select a valid private key. Exiting."
         return 1
     fi
     
-    local key_name=$(basename "$private_key_path")
-    local destination_path="$ssh_keys_location$key_name"
+    key_name=$(basename "$private_key_path")
+    destination_path="$ssh_keys_location$key_name"
     
     if [[ "$private_key_path" != "$destination_path" ]]; then
         cp -f "$private_key_path" "$destination_path"
-        cleanup_and_update_ssh_config
         echo "Private key copied to $destination_path"
     fi
-    
+
     chmod 600 "$destination_path"
     
     if [ ! -f "${destination_path}.pub" ]; then
@@ -104,8 +251,11 @@ import_private_key() {
         ssh-keygen -y -f "$destination_path" > "${destination_path}.pub"
         echo "Public key generated: ${destination_path}.pub"
     fi
+    chmod 644 "${destination_path}.pub"
     
-    if prompt_yes_no "Do you want to check the configuration for multiple remote hosts? (This is not strictly necessary when the remote hosts were properly configured before and the imported was already registered automatically. The check requires user interaction by entering each password multiple times for each host.)" "n"; then
+    cleanup_and_update_ssh_config
+    
+    if prompt_yes_no "Do you want to check the configuration for multiple remote hosts? (This is not strictly necessary when the remote hosts were properly configured before and the imported key was already registered automatically. The check requires user interaction by entering each password multiple times for each host.)" "n"; then
         while true; do
             local host=$(prompt_with_default "Enter host (or press Enter to finish)" "")
             if [ -z "$host" ]; then
@@ -120,6 +270,9 @@ import_private_key() {
             configure_remote_ssh "$remote_user" "$host"
             configure_local_ssh "$key_name" "$host" "$remote_user"
             check_remote_ssh_config "$remote_user" "$host" "$destination_path"
+            if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
+                check_local_ssh_security
+            fi
         done
     fi
 }
@@ -208,6 +361,9 @@ copy_pubkey_to_hosts() {
         configure_remote_ssh "$remote_user" "$host"
         configure_local_ssh "$(basename "$pubkey_path" .pub)" "$host" "$remote_user"
         check_remote_ssh_config "$remote_user" "$host" "$pubkey_path"
+        if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
+            check_local_ssh_security
+        fi
     done
 }
 
@@ -282,7 +438,6 @@ configure_local_ssh() {
 
 cleanup_and_update_ssh_config() {
     local ssh_config="$ssh_keys_location/config"
-
     echo "Updating SSH config..."
 
     # Create a temporary file
@@ -291,9 +446,15 @@ cleanup_and_update_ssh_config() {
     # Write the Host * block
     echo "Host *" > "$temp_config"
 
+    # Array to store unique IdentityFile entries
+    declare -A identity_files
+
     # Find all private key files and add them as IdentityFile entries
     find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
-        echo "    IdentityFile $key_file" >> "$temp_config"
+        if [[ ! ${identity_files[$key_file]} ]]; then
+            echo "    IdentityFile $key_file" >> "$temp_config"
+            identity_files[$key_file]=1
+        fi
     done
 
     # Add a blank line for readability
@@ -303,9 +464,10 @@ cleanup_and_update_ssh_config() {
     if [[ -f "$ssh_config" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             if [[ "$line" =~ ^[[:space:]]*IdentityFile[[:space:]]+(.*) ]]; then
-                # Check if the IdentityFile exists
-                if [[ -f "${BASH_REMATCH[1]}" ]]; then
+                # Check if the IdentityFile exists and hasn't been added yet
+                if [[ -f "${BASH_REMATCH[1]}" && ! ${identity_files[${BASH_REMATCH[1]}]} ]]; then
                     echo "$line" >> "$temp_config"
+                    identity_files[${BASH_REMATCH[1]}]=1
                 fi
             elif [[ "$line" != "Host *" ]]; then
                 # Keep all other lines except "Host *"
@@ -319,6 +481,7 @@ cleanup_and_update_ssh_config() {
     chmod 600 "$ssh_config"
 
     echo "SSH configuration update complete."
+    results[9]="PASS"
 }
 
 check_remote_ssh_config() {
