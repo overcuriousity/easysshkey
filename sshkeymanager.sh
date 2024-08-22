@@ -435,11 +435,9 @@ cleanup_and_update_ssh_config() {
 
     # Generate public keys for all private keys
     find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
-        if [ ! -f "${key_file}.pub" ]; then
-            echo "Public key not found for $key_file. Generating..."
-            ssh-keygen -y -f "$key_file" > "${key_file}.pub"
-            echo "Public key generated: ${key_file}.pub"
-        fi
+        echo "Generating public key for $key_file..."
+        ssh-keygen -y -f "$key_file" > "${key_file}.pub"
+        echo "Public key generated/updated: ${key_file}.pub"
         chmod 644 "${key_file}.pub"
     done
 
