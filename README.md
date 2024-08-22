@@ -52,8 +52,6 @@ Follow the on-screen prompts to perform various SSH key management tasks.
 
 ## Security Considerations
 
-- This script modifies SSH configurations and key files. Always review the changes and ensure they align with your security policies.
-- Backup your existing SSH configurations and keys before using this script.
 - The script may require sudo privileges for some operations. Review the code to understand what elevated actions it performs.
 
 ## Compatibility
