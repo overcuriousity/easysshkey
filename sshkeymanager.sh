@@ -1,9 +1,43 @@
 #!/usr/bin/env bash
-sshd_config="/etc/ssh/sshd_config"
-ssh_keys_location="$HOME/.ssh/"
 
+# SSH Key Management Script
+# Version: 1.1
+#
+# This script provides a comprehensive set of tools for managing SSH keys and configurations.
+# It allows users to generate new SSH key pairs, import existing keys, configure remote hosts,
+# and perform local SSH security checks.
+#
+# Features:
+# - Generate new SSH key pairs with various encryption types
+# - Import existing private keys and configure them for use
+# - Copy public keys to remote hosts
+# - Perform local SSH security checks and fix common issues
+# - Backup existing SSH configurations before making changes
+# - Dry-run mode to preview changes without applying them
+#
+# Usage:
+#   ./ssh_key_manager.sh [options]
+#
+# Options:
+#   -b, --backup     Create a backup of SSH configurations before making changes
+#   -d, --dry-run    Run in dry-run mode (show changes without applying them)
+#   -h, --help       Display this help message
+#
+# Requirements:
+# - Bash 4.0 or later
+# - OpenSSH client
+# - sudo privileges (for some operations)
+#
+# Note: This script modifies system files and SSH configurations. Use with caution.
+
+# Exit on error
 set -e
 
+# Script configuration
+sshd_config="/etc/ssh/sshd_config"
+ssh_keys_location="$HOME/.ssh/"
+backup_dir="$HOME/.ssh/backups/.ssh_backup_$(date +%Y%m%d_%H%M%S)"
+dry_run=false
 
 # Color definitions
 RED='\033[0;31m'
@@ -12,6 +46,42 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+# Function to display help message
+display_help() {
+    echo "Usage: $0 [options]"
+    echo
+    echo "Options:"
+    echo "  -b, --backup     Create a backup of SSH configurations before making changes"
+    echo "  -d, --dry-run    Run in dry-run mode (show changes without applying them)"
+    echo "  -h, --help       Display this help message"
+    echo
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -b|--backup)
+            mkdir -p "$backup_dir"
+            cp -r "$ssh_keys_location" "$backup_dir"
+            echo "Backup created in $backup_dir"
+            shift
+            ;;
+        -d|--dry-run)
+            dry_run=true
+            echo "Running in dry-run mode. No changes will be applied."
+            shift
+            ;;
+        -h|--help)
+            display_help
+            ;;
+        *)
+            echo "Unknown option: $1"
+            display_help
+            ;;
+    esac
+done
 
 # Output functions
 info() {
@@ -28,6 +98,15 @@ error() {
 
 success() {
     echo -e "${GREEN}SUCCESS: ${NC}$1"
+}
+
+# Function to execute or simulate command based on dry-run mode
+execute_or_simulate() {
+    if [ "$dry_run" = true ]; then
+        echo "Would execute: $@"
+    else
+        "$@"
+    fi
 }
 
 
@@ -731,16 +810,16 @@ while true; do
     # Process user input
     case "$option" in
         1)
-            generate_ssh_key
+            execute_or_simulate generate_ssh_key
             ;;
         2)
-            import_private_key
+            execute_or_simulate import_private_key
             ;;
         3)
-            copy_pubkey_to_hosts
+            execute_or_simulate copy_pubkey_to_hosts
             ;;
         4) 
-            check_local_ssh_security
+            execute_or_simulate check_local_ssh_security
             ;;
         q|Q)
             info "Exiting script. Goodbye!"
