@@ -449,6 +449,9 @@ cleanup_and_update_ssh_config() {
     # Array to store unique IdentityFile entries
     declare -A identity_files
 
+    # Write the Host * block
+    echo "Host *" > "$temp_config"
+
     # Find all private key files and add them as IdentityFile entries
     find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
         if [[ ! ${identity_files[$key_file]} ]]; then
@@ -456,9 +459,6 @@ cleanup_and_update_ssh_config() {
             identity_files[$key_file]=1
         fi
     done
-
-    # Add a blank line for readability
-    echo "" >> "$temp_config"
 
     # If the config file already exists, process its content
     if [[ -f "$ssh_config" ]]; then
