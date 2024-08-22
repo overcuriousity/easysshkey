@@ -246,13 +246,6 @@ import_private_key() {
 
     chmod 600 "$destination_path"
     
-    if [ ! -f "${destination_path}.pub" ]; then
-        echo "Public key not found. Generating from private key..."
-        ssh-keygen -y -f "$destination_path" > "${destination_path}.pub"
-        echo "Public key generated: ${destination_path}.pub"
-    fi
-    chmod 644 "${destination_path}.pub"
-    
     cleanup_and_update_ssh_config
     
     if prompt_yes_no "Do you want to check the configuration for multiple remote hosts? (This is not strictly necessary when the remote hosts were properly configured before and the imported key was already registered automatically. The check requires user interaction by entering each password multiple times for each host.)" "n"; then
@@ -440,6 +433,16 @@ cleanup_and_update_ssh_config() {
     local ssh_config="$ssh_keys_location/config"
     echo "Updating SSH config..."
 
+    # Generate public keys for all private keys
+    find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
+        if [ ! -f "${key_file}.pub" ]; then
+            echo "Public key not found for $key_file. Generating..."
+            ssh-keygen -y -f "$key_file" > "${key_file}.pub"
+            echo "Public key generated: ${key_file}.pub"
+        fi
+        chmod 644 "${key_file}.pub"
+    done
+
     # Create a temporary file
     local temp_config=$(mktemp)
 
@@ -449,10 +452,7 @@ cleanup_and_update_ssh_config() {
     # Array to store unique IdentityFile entries
     declare -A identity_files
 
-    # Write the Host * block
-    echo "Host *" > "$temp_config"
-
-    # Find all private key files and add them as IdentityFile entries
+    # Add all private key files as IdentityFile entries
     find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
         if [[ ! ${identity_files[$key_file]} ]]; then
             echo "    IdentityFile $key_file" >> "$temp_config"
