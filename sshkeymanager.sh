@@ -156,13 +156,13 @@ generate_ssh_key() {
     select_key_size
     select_passphrase_option
     select_key_name
-
-    read remote_host remote_user <<< $(prompt_remote_details)
-
     generate_key "$key_type" "$key_size" "$key_name" "$use_passphrase"
-    copy_key_to_remote "$key_name" "$remote_host" "$remote_user"
-    success "Initial SSH login via password successful!"
-    configure_remote_ssh "$remote_user" "$remote_host"
+    
+    if prompt_yes_no "Do you want to configure this key for a remote host? (Recommended)" "y"; then
+        copy_key_to_remote "$key_name" "$remote_host" "$remote_user"
+        success "Initial SSH login via password successful!"
+        configure_remote_ssh "$remote_user" "$remote_host"
+    fi
     configure_local_ssh "$key_name"
     check_remote_ssh_config "$remote_user" "$remote_host" "$ssh_keys_location$key_name"
     display_key_generation_summary "$key_type" "$use_passphrase"
