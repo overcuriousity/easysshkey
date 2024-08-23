@@ -34,15 +34,22 @@
 set -e
 # debug
 #set -x
+# debug
+#set -x
 
+# Configurable via menu globals
 # Configurable via menu globals
 sshd_config="/etc/ssh/sshd_config"
 ssh_keys_location="$HOME/.ssh/"
-backup_dir="$HOME/.ssh/backups/.ssh_backup_$(date +%Y%m%d_%H%M%S)"
+backup_dir="$HOME/.sshbackups/ssh_backup_$(date +%Y%m%d_%H%M%S)"
+agnostic_authorized_keys=true
+
+# Global variables
 agnostic_authorized_keys=true
 
 # Global variables
 dry_run=false
+override_security=false
 override_security=false
 
 # Color definitions
@@ -62,6 +69,10 @@ display_help() {
     echo "  -d, --dry-run              Run in dry-run mode (show changes without applying them)"
     echo "  -h, --help                 Display this help message"
     echo "  -o. --override-security    Overrides mandatory key passphrase for permissive keys"
+    echo "  -b, --backup               Create a backup of SSH configurations before making changes"
+    echo "  -d, --dry-run              Run in dry-run mode (show changes without applying them)"
+    echo "  -h, --help                 Display this help message"
+    echo "  -o. --override-security    Overrides mandatory key passphrase for permissive keys"
     exit 0
 }
 
@@ -72,10 +83,12 @@ while [[ $# -gt 0 ]]; do
             mkdir -p "$backup_dir"
             cp -r "$ssh_keys_location" "$backup_dir"
             info "Backup created in $backup_dir"
+            info "Backup created in $backup_dir"
             shift
             ;;
         -d|--dry-run)
             dry_run=true
+            info "Running in dry-run mode. No changes will be applied."
             info "Running in dry-run mode. No changes will be applied."
             shift
             ;;
@@ -85,7 +98,11 @@ while [[ $# -gt 0 ]]; do
         -o|--override-security)
             override_security=true
             ;;
+        -o|--override-security)
+            override_security=true
+            ;;
         *)
+            error "Unknown option: $1"
             error "Unknown option: $1"
             display_help
             ;;
@@ -169,12 +186,16 @@ generate_ssh_key() {
     
     if prompt_yes_no "Do you want to configure this key for a remote host? (Recommended)" "y"; then
         check_remote=true
+        check_remote=true
         read remote_host remote_user <<< $(prompt_remote_details)
         copy_key_to_remote "$key_name" "$remote_host" "$remote_user"
         success "Initial SSH login via password successful!"
         configure_remote_ssh "$remote_user" "$remote_host"
     fi
     configure_local_ssh "$key_name"
+    if [ "$check_remote" = true ]; then
+        check_remote_ssh_config "$remote_user" "$remote_host" "$ssh_keys_location$key_name"
+    fi
     if [ "$check_remote" = true ]; then
         check_remote_ssh_config "$remote_user" "$remote_host" "$ssh_keys_location$key_name"
     fi
@@ -197,6 +218,7 @@ select_key_type() {
             3) key_type="ecdsa"; break;;
             4) select_hardware_key_type; break;;
             *) error "Invalid choice. Please try again.";;
+            *) error "Invalid choice. Please try again.";;
         esac
     done
 }
@@ -204,12 +226,14 @@ select_key_type() {
 select_hardware_key_type() {
     echo -e "\n${CYAN}Select Hardware Key Type:${NC}"
     warn "This option requires the system packages openssh and libfido2 to be installed for your distribution!"
+    warn "This option requires the system packages openssh and libfido2 to be installed for your distribution!"
     echo "1. Ed25519-SK (Recommended if supported by your device)"
     echo "2. ECDSA-SK (Better compatibility with older hardware keys)"
     read -p "Enter your choice (1-2): " hw_key_choice
     case $hw_key_choice in
         1) key_type="ed25519-sk";;
         2) key_type="ecdsa-sk";;
+        *) error "Invalid choice. Please try again."; select_hardware_key_type;;
         *) error "Invalid choice. Please try again."; select_hardware_key_type;;
     esac
 }
@@ -233,12 +257,43 @@ select_key_size() {
                 2) key_size=$([ "$key_type" == "rsa" ] && echo "4096" || echo "384"); break;;
                 3) [ "$key_type" == "ecdsa" ] && { key_size="521"; break; } || error "Invalid choice for RSA. Please try again.";;
                 *) error "Invalid choice. Please try again.";;
+                3) [ "$key_type" == "ecdsa" ] && { key_size="521"; break; } || error "Invalid choice for RSA. Please try again.";;
+                *) error "Invalid choice. Please try again.";;
             esac
         done
     fi
 }
 
 select_passphrase_option() {
+    if [ "$agnostic_authorized_keys" != true ]; then
+        echo -e "\n${CYAN}Passphrase Option:${NC}"
+        echo "Using a passphrase adds an extra layer of security to your SSH key."
+        echo "+ Advantages: Protects the key if it's stolen or accessed by unauthorized users"
+        echo "- Disadvantages: You'll need to enter the passphrase each time you use the key (unless using ssh-agent)"
+        info "You have a choice here because of the current settings, which are restrictive - ${GREEN}remote hosts${NC} will be configured within their authorized hosts to ${GREEN}only accept connections with your given username/hostname${NC} configuration."
+        
+        if prompt_yes_no "Do you want to set a passphrase for your SSH key?" "n"; then
+            use_passphrase=true
+            info "You will be prompted to enter the passphrase during key generation."
+        else
+            use_passphrase=false
+            info "No passphrase will be set. Your key will not be password-protected - this is not a problem if you don't lose your key."
+        fi
+    else
+        if [ "$override_security" != true ]; then
+            info "Remote host configuration currently is ${GREEN}permissive${NC}, which allows you to ${GREEN}log in from any host as any user${NC}, as long as you have the keys."
+            info "${RED}If you happen to leak your private key, a malicious actor can log in as you would. Because of that, setting a passphrase to protect your private key is mandatory.${NC}"
+            info "If you want to change this setting, do so in the settings menu or the configuration variables (agnostic_authorized_keys=false)"
+            use_passphrase=true
+        else
+            if prompt_yes_no "Do you want to set a passphrase for your SSH key?" "n"; then
+                use_passphrase=true
+                info "You will be prompted to enter the passphrase during key generation."
+            else
+                use_passphrase=false
+                info "No passphrase will be set. Your key will not be password-protected - this is not a problem if you don't lose your key."
+            fi
+        fi
     if [ "$agnostic_authorized_keys" != true ]; then
         echo -e "\n${CYAN}Passphrase Option:${NC}"
         echo "Using a passphrase adds an extra layer of security to your SSH key."
@@ -281,6 +336,7 @@ select_key_name() {
             break
         else
             error "Key name must start with 'id_'. Please try again."
+            error "Key name must start with 'id_'. Please try again."
         fi
     done
 }
@@ -312,6 +368,7 @@ generate_hardware_key() {
     echo "Please insert your hardware security key and follow any prompts."
     if ! ssh-keygen -t $key_type -f "$ssh_keys_location$key_name" ${use_passphrase:+-N ""}; then
         error "Failed to generate hardware-backed key. This might be due to missing libfido2 library."
+        error "Failed to generate hardware-backed key. This might be due to missing libfido2 library."
         echo "For Debian-based systems, try installing it with:"
         echo "sudo apt update && sudo apt install libfido2-1"
         echo "For Arch-based systems, use:"
@@ -325,6 +382,11 @@ generate_ed25519_key() {
     local key_name="$1"
     local use_passphrase="$2"
 
+    if [ "$use_passphrase" = true ]; then
+        ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name"
+    else
+        ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name" -N ""
+    fi
     if [ "$use_passphrase" = true ]; then
         ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name"
     else
@@ -353,8 +415,9 @@ copy_key_to_remote() {
         ssh-copy-id -f -i "$ssh_keys_location$key_name.pub" "$remote_user@$remote_host"
     else
         info "Adding key to authorized_keys without user/hostname restrictions"
-        # Read the public key
-        local pubkey=$(cat "$ssh_keys_location$key_name.pub")
+        # Read the public key and remove the username@hostname part
+        local pubkey=$(awk '{print $1 " " $2}' "$ssh_keys_location$key_name.pub")
+        echo "$pubkey"
         # Append the key to the remote authorized_keys file
         ssh "$remote_user@$remote_host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$pubkey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
     fi     
@@ -386,37 +449,42 @@ import_private_key() {
     local key_name
     local destination_path
 
-    local private_key_path=$(select_key_file "private" "$ssh_keys_location/id_rsa" "id_*" "false")
-    if [ $? -ne 0 ]; then
-        error "Failed to select a valid private key. Exiting."
-        return 1
-    fi
-    
-    key_name=$(basename "$private_key_path")
-    destination_path="$ssh_keys_location$key_name"
-    
-    copy_and_set_permissions "$private_key_path" "$destination_path"
-    
-    cleanup_and_update_ssh_config
-    configure_local_ssh "$key_name"
-    
     while true; do
-        read remote_host remote_user <<< $(prompt_remote_details)
-        
-        if [ -z "$remote_host" ]; then
-            break
+        local private_key_path=$(select_key_file "private" "$ssh_keys_location/id_rsa" "id_*" "false")
+        if [ $? -ne 0 ]; then
+            error "Failed to select a valid private key. Exiting."
+            return 1
         fi
         
-        configure_remote_ssh "$remote_user" "$remote_host"
-        check_remote_ssh_config "$remote_user" "$remote_host" "$destination_path"
+        key_name=$(basename "$private_key_path")
+        destination_path="$ssh_keys_location$key_name"
         
-        if ! prompt_yes_no "Do you want to configure this key for another host?" "n"; then
+        copy_and_set_permissions "$private_key_path" "$destination_path"
+        
+        cleanup_and_update_ssh_config
+        configure_local_ssh "$key_name"
+        
+        while true; do
+            read remote_host remote_user <<< $(prompt_remote_details)
+            
+            if [ -z "$remote_host" ]; then
+                break
+            fi
+            
+            configure_remote_ssh "$remote_user" "$remote_host"
+            check_remote_ssh_config "$remote_user" "$remote_host" "$destination_path"
+            
+            if ! prompt_yes_no "Do you want to configure this key for another host?" "n"; then
+                break
+            fi
+        done
+        #if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
+        #            check_local_ssh_security
+        #fi
+        if prompt_yes_no "Do you want to import another private key?" "n"; then
             break
         fi
     done
-    if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
-                check_local_ssh_security
-    fi
 }
 
 # Updated function to copy public key to additional hosts
@@ -426,6 +494,7 @@ copy_pubkey_to_hosts() {
     pubkey_path=$(select_key_file "public" "$ssh_keys_location/id_*.pub" "id_*.pub" "true")
     key_name=$(basename "$pubkey_path" .pub)
     if [ $? -ne 0 ]; then
+        error "Failed to select a valid public key. Exiting."
         error "Failed to select a valid public key. Exiting."
         return 1
     fi
@@ -439,13 +508,14 @@ copy_pubkey_to_hosts() {
         fi
         
         info "Copying public key '$pubkey_path' to $remote_host..."
+        info "Copying public key '$pubkey_path' to $remote_host..."
         copy_key_to_remote "$(basename "$pubkey_path" .pub)" "$remote_host" "$remote_user"
         
         configure_remote_ssh "$remote_user" "$remote_host"
         check_remote_ssh_config "$remote_user" "$remote_host" "$pubkey_path"
-        if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
-            check_local_ssh_security
-        fi
+        #if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
+        #    check_local_ssh_security
+        #fi
         
         if ! prompt_yes_no "Do you want to copy the key to another host?" "n"; then
             break
@@ -471,6 +541,7 @@ select_key_file() {
 
     if [ ${#files[@]} -eq 0 ]; then
         error "No $key_type keys found in ~/.ssh directory." >&2
+        error "No $key_type keys found in ~/.ssh directory." >&2
         selected_file=$(prompt_with_default "Enter path to $key_type key" "")
     else
         echo "Select a $key_type key:" >&2
@@ -491,6 +562,7 @@ select_key_file() {
                             break
                         else
                             error "Invalid selection or file not found. Please try again." >&2
+                            error "Invalid selection or file not found. Please try again." >&2
                         fi
                     fi
                     ;;
@@ -500,6 +572,7 @@ select_key_file() {
 
     # Verify that the selected file exists and is readable
     if [ ! -f "$selected_file" ] || [ ! -r "$selected_file" ]; then
+        error "The selected $key_type key file does not exist or is not readable: $selected_file" >&2
         error "The selected $key_type key file does not exist or is not readable: $selected_file" >&2
         return 1
     fi
@@ -514,6 +587,7 @@ copy_and_set_permissions() {
 
     if [[ "$source_path" != "$dest_path" ]]; then
         cp -f "$source_path" "$dest_path"
+        info "Private key copied to $dest_path"
         info "Private key copied to $dest_path"
     fi
 
@@ -600,6 +674,7 @@ EOF
 configure_local_ssh() {
     local key_name="$1"
     info "Configuring local SSH to use the new key..."
+    info "Configuring local SSH to use the new key..."
 
     # Set correct permissions for the private key file
     chmod 600 "$ssh_keys_location$key_name"
@@ -621,6 +696,7 @@ cleanup_and_update_ssh_config() {
     fi
 
     info "Updating SSH config..."
+    info "Updating SSH config..."
 
     # Ensure the .ssh directory exists
     mkdir -p "$ssh_keys_location"
@@ -628,7 +704,9 @@ cleanup_and_update_ssh_config() {
     # Generate public keys for all private keys
     find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
         #info "Generating public key for $key_file..."
+        #info "Generating public key for $key_file..."
         ssh-keygen -y -f "$key_file" > "${key_file}.pub"
+        #success "Public key generated/updated: ${key_file}.pub"
         #success "Public key generated/updated: ${key_file}.pub"
         chmod 644 "${key_file}.pub"
     done
@@ -671,6 +749,7 @@ cleanup_and_update_ssh_config() {
     chmod 600 "$ssh_config"
 
     info "SSH configuration update complete."
+    info "SSH configuration update complete."
     results[9]="PASS"
 }
 
@@ -680,12 +759,14 @@ check_remote_ssh_config() {
     local key_file="$3"
 
     info "Checking remote SSH configuration..."
+    info "Checking remote SSH configuration..."
 
     # Ensure we're using the private key, not the public key
     local private_key_file="${key_file%.pub}"
 
     # Check if the file exists
     if [ ! -f "$private_key_file" ]; then
+        error "Private key file $private_key_file does not exist."
         error "Private key file $private_key_file does not exist."
         return 1
     fi
@@ -886,7 +967,6 @@ fix_local_ssh_security() {
     sudo systemctl restart sshd.service
 }
 
-# Add this new function
 display_main_menu() {
     echo -e "\n${GREEN}SSH Key Setup Script Menu${NC}"
     echo -e "${BLUE}═════════════════════════${NC}\n"
@@ -911,15 +991,403 @@ display_main_menu() {
     echo "   PERFORMS: Automated local security checks conforming to best practices"
     echo ""
 
+    echo -e "${CYAN}5. Advanced settings${NC}"
+    echo "   Access advanced settings for default configurations and remote host settings"
+    echo ""
+
     echo -e "${YELLOW}q. Exit${NC}"
     echo ""
+}
+
+display_settings_menu() {
+    local settings_option
+    while true; do
+        echo -e "\n${GREEN}Advanced Settings Menu${NC}"
+        echo -e "${BLUE}═════════════════════════${NC}\n"
+        echo -e "${CYAN}1. Set global variables${NC}"
+        echo -e "${CYAN}2. Backup SSH Keys${NC}"
+        echo -e "${CYAN}3. Manipulate remote authorized_keys${NC}"
+        echo ""
+        echo -e "${YELLOW}q. Return to main menu${NC}"
+        echo ""
+
+        read -p "$(echo -e "${BLUE}Choose an option (1/2/3/q): ${NC}")" settings_option
+        
+        case "$settings_option" in
+            1)
+                display_global_variables_menu
+                ;;
+            2)
+                backup_ssh_keys
+                ;;
+            3)
+                manipulate_remote_pubkeyfile
+                ;;
+            q|Q)
+                return
+                ;;
+            *)
+                error "Invalid option. Please try again."
+                ;;
+        esac
+    done
+}
+
+display_global_variables_menu() {
+    local var_option
+    while true; do
+        echo -e "\n${GREEN}Global Variables Menu${NC}"
+        echo -e "${BLUE}═════════════════════════${NC}\n"
+        echo -e "${CYAN}1. SSH key location${NC}"
+        echo "   CURRENT: $ssh_keys_location"
+        echo -e "${CYAN}2. SSH daemon config location${NC}"
+        echo "   CURRENT: $sshd_config"
+        echo -e "${CYAN}3. Agnostic authorized keys${NC}"
+        echo "   CURRENT: $agnostic_authorized_keys"
+        echo -e "${CYAN}4. Backup directory${NC}"
+        echo "   CURRENT: $backup_dir"
+        echo ""
+        echo -e "${YELLOW}q. Return to Advanced Settings Menu${NC}"
+        echo ""
+
+        read -p "$(echo -e "${BLUE}Choose a variable to modify (1/2/3/4/q): ${NC}")" var_option
+        
+        case "$var_option" in
+            1)
+                read -p "Enter new SSH key location: " new_location
+                if [ -d "$new_location" ]; then
+                    ssh_keys_location="$new_location"
+                    success "SSH key location updated."
+                else
+                    error "Invalid directory. Please try again."
+                fi
+                ;;
+            2)
+                read -p "Enter new SSH daemon config location: " new_sshd_config
+                if [ -f "$new_sshd_config" ]; then
+                    sshd_config="$new_sshd_config"
+                    success "SSH daemon config location updated."
+                else
+                    error "File not found. Please try again."
+                fi
+                ;;
+            3)
+                if prompt_yes_no "Enable agnostic authorized keys?" "$agnostic_authorized_keys"; then
+                    agnostic_authorized_keys=true
+                else
+                    agnostic_authorized_keys=false
+                fi
+                success "Agnostic authorized keys setting updated."
+                ;;
+            4)
+                read -p "Enter new backup dir pattern: " new_pattern
+                backup_dir="$new_pattern"
+                success "Backup dir pattern updated."
+                ;;
+            q|Q)
+                return
+                ;;
+            *)
+                error "Invalid option. Please try again."
+                ;;
+        esac
+    done
+}
+
+backup_ssh_keys() {
+    local default_backup_dir="$backup_dir"
+    local chosen_backup_dir
+    local timestamp=$(date +"%Y%m%d_%H%M%S")
+
+    echo -e "\n${CYAN}SSH Key Backup${NC}"
+    echo -e "${BLUE}═════════════════════════${NC}\n"
+
+    echo -e "Default backup directory: ${YELLOW}$default_backup_dir${NC}"
+    if prompt_yes_no "Use default backup directory?" "y"; then
+        chosen_backup_dir="$default_backup_dir"
+    else
+        read -p "Enter the desired backup directory path: " chosen_backup_dir
+    fi
+
+    # Ensure the chosen directory exists
+    mkdir -p "$chosen_backup_dir"
+
+    # Create a subdirectory with timestamp
+    local backup_path="${chosen_backup_dir}/ssh_backup_${timestamp}"
+    mkdir -p "$backup_path"
+
+    # Copy SSH directory contents to the backup location
+    if cp -R "$ssh_keys_location"* "$backup_path"; then
+        # Set appropriate permissions for the backed-up files
+        chmod 700 "$backup_path"
+        find "$backup_path" -type f -exec chmod 600 {} \;
+        find "$backup_path" -name "*.pub" -type f -exec chmod 644 {} \;
+
+        success "SSH keys and configurations backed up successfully to: $backup_path"
+    else
+        error "Failed to create backup. Please check permissions and try again."
+    fi
+}
+
+manipulate_remote_pubkeyfile() {
+    local remote_host remote_user remote_file local_file
+
+    # Step 1: Get remote details and download the file
+    read remote_host remote_user <<< $(prompt_remote_details)
+    remote_file="/home/$remote_user/.ssh/authorized_keys"
+    local_file=$(mktemp)
+    if ! scp "$remote_user@$remote_host:$remote_file" "$local_file"; then
+        error "Failed to download the remote file."
+        return 1
+    fi
+
+    # Main loop for file manipulation
+    while true; do
+        display_file_contents "$local_file"
+        echo -e "${CYAN}Enter:${NC}"
+        echo -e "  ${YELLOW}- A line number to edit that line${NC}"
+        echo -e "  ${YELLOW}- 'd' followed by a line number to delete that line (e.g., d3)${NC}"
+        echo -e "  ${YELLOW}- 'n' to append a new line${NC}"
+        echo -e "  ${YELLOW}- Press Enter without input to finish editing${NC}"
+        read -p "Your choice: " user_input
+
+        if [ -z "$user_input" ]; then
+            break
+        elif [[ "$user_input" =~ ^[0-9]+$ ]]; then
+            edit_line "$user_input" "$local_file"
+        elif [[ "$user_input" =~ ^d[0-9]+$ ]]; then
+            delete_line "${user_input:1}" "$local_file"
+        elif [[ "$user_input" == "n" ]]; then
+            append_new_line "$local_file"
+        else
+            error "Invalid input. Please try again."
+            continue
+        fi
+    done
+
+    if scp "$local_file" "$remote_user@$remote_host:$remote_file"; then
+        success "File successfully updated on the remote host."
+    else
+        error "Failed to upload the updated file to the remote host."
+    fi
+
+    rm -f "$local_file"
+}
+
+edit_line() {
+    local line_number="$1"
+    local file="$2"
+
+    if [ "$line_number" -eq 0 ] || [ "$line_number" -gt "$(wc -l < "$file")" ]; then
+        error "Invalid line number. Please try again."
+        return
+    fi
+
+    current_line=$(sed "${line_number}q;d" "$file")
+    local options key_type key_data
+    if [[ $current_line == *"ssh-"* || $current_line == *"ecdsa-"* ]]; then
+        options=$(echo "$current_line" | awk '{for(i=1;i<NF-1;i++) if ($i !~ /^(ssh-|ecdsa-)/) printf "%s ", $i}')
+        key_type=$(echo "$current_line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^(ssh-|ecdsa-)/) {print $i; exit}}')
+        key_data=$(echo "$current_line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^(ssh-|ecdsa-)/) {print $(i+1); exit}}')
+    else
+        error "Invalid key format in line $line_number"
+        return
+    fi
+
+    while true; do
+        echo -e "\n${CYAN}Current values:${NC}"
+        echo -e "${YELLOW}1. Key Type:${NC} $key_type"
+        echo -e "${YELLOW}2. Key Data:${NC} $key_data"
+        echo -e "${YELLOW}3. Options:${NC} $options"
+        echo -e "${YELLOW}4. Manage Options${NC}"
+        echo -e "Press Enter to finish editing this line"
+
+        read -p "Select a value to edit (1-4) or press Enter to finish: " value_choice
+
+        case $value_choice in
+            1)
+                read -p "Enter new key type: " key_type
+                ;;
+            2)
+                read -p "Enter new key data: " key_data
+                ;;
+            3)
+                read -p "Enter new options: " options
+                ;;
+            4)
+                manage_key_options
+                ;;
+            "")
+                break
+                ;;
+            *)
+                error "Invalid choice. Please try again."
+                continue
+                ;;
+        esac
+
+        new_line="$options $key_type $key_data"
+        sed -i "${line_number}s|.*|$new_line|" "$file"
+        success "Line updated."
+    done
+}
+
+delete_line() {
+    local line_number="$1"
+    local file="$2"
+
+    if [ "$line_number" -eq 0 ] || [ "$line_number" -gt "$(wc -l < "$file")" ]; then
+        error "Invalid line number. Please try again."
+        return
+    fi
+
+    sed -i "${line_number}d" "$file"
+    success "Line $line_number deleted."
+}
+
+append_new_line() {
+    local file="$1"
+    local new_key_type new_key_data new_options
+
+    read -p "Enter key type: " new_key_type
+    read -p "Enter key data: " new_key_data
+    read -p "Enter options (press Enter for none): " new_options
+
+    echo "$new_options $new_key_type $new_key_data" >> "$file"
+    success "New line appended."
+}
+
+manage_key_options() {
+    local option_choice
+    while true; do
+        echo -e "\n${CYAN}Manage Key Options:${NC}"
+        echo -e "${YELLOW}1. Set/Update command restriction${NC}"
+        echo -e "   ${WHITE}Restricts the key to executing only a specific command${NC}"
+        echo -e "   ${WHITE}Example: command=\"/usr/bin/rsync --server\" restricts to rsync only${NC}"
+        
+        echo -e "\n${YELLOW}2. Set/Update from (source IP restriction)${NC}"
+        echo -e "   ${WHITE}Restricts the key to be used only from specific IP addresses${NC}"
+        echo -e "   ${WHITE}Example: from=\"192.168.1.0/24,10.0.0.*\" allows from a subnet and IP range${NC}"
+        
+        echo -e "\n${YELLOW}3. Set/Update source user restriction${NC}"
+        echo -e "   ${WHITE}Restricts the key to be used only by specific users${NC}"
+        echo -e "   ${WHITE}Example: from=\"user=john,jane\" allows only john and jane to use this key${NC}"
+        
+        echo -e "\n${YELLOW}4. Set/Update source host restriction${NC}"
+        echo -e "   ${WHITE}Restricts the key to be used only from specific hostnames${NC}"
+        echo -e "   ${WHITE}Example: from=\"host=*.example.com\" allows use from hosts in example.com domain${NC}"
+        
+        echo -e "\n${YELLOW}5. Set/Update permitopen${NC}"
+        echo -e "   ${WHITE}Specifies which hosts and ports the user is allowed to connect to via port forwarding${NC}"
+        echo -e "   ${WHITE}Example: permitopen=\"192.168.1.1:80\" allows forwarding to that IP and port${NC}"
+        
+        echo -e "\n${YELLOW}6. Set/Update environment variable${NC}"
+        echo -e "   ${WHITE}Sets an environment variable when the key is used${NC}"
+        echo -e "   ${WHITE}Example: environment=\"DEBUG=1\" sets DEBUG environment variable${NC}"
+        
+        echo -e "\n${YELLOW}7. Toggle no-agent-forwarding${NC}"
+        echo -e "   ${WHITE}Disables SSH agent forwarding${NC}"
+        
+        echo -e "\n${YELLOW}8. Toggle no-port-forwarding${NC}"
+        echo -e "   ${WHITE}Disables port forwarding${NC}"
+        
+        echo -e "\n${YELLOW}9. Toggle no-X11-forwarding${NC}"
+        echo -e "   ${WHITE}Disables X11 forwarding${NC}"
+        
+        echo -e "\n${YELLOW}10. Toggle no-pty${NC}"
+        echo -e "   ${WHITE}Disables PTY (pseudo-terminal) allocation${NC}"
+        
+        echo -e "\n${YELLOW}11. Remove all options${NC}"
+        echo -e "   ${WHITE}Clears all existing options for this key${NC}"
+        
+        echo -e "\n${GREEN}Current options:${NC} ${options:-None}"
+        
+        echo -e "\n${YELLOW}Enter your choice (1-11) or press Enter to finish:${NC}"
+        read -p "" option_choice
+
+        case $option_choice in
+            1)
+                read -p "Enter command restriction (or press Enter to remove): " cmd
+                options=$(echo "$options" | sed 's/command="[^"]*"//')
+                [ -n "$cmd" ] && options="command=\"$cmd\" $options"
+                ;;
+            2)
+                read -p "Enter IP restriction (or press Enter to remove): " from_ip
+                options=$(echo "$options" | sed -E 's/from="([^"]*,)?(([0-9]+\.){3}[0-9]+|[0-9]+\.[0-9]+\.[0-9]+\.\*|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+)([^"]*)"/\1\4/')
+                [ -n "$from_ip" ] && options="from=\"$from_ip${options:+,$options}\""
+                ;;
+            3)
+                read -p "Enter user restriction (or press Enter to remove): " from_user
+                options=$(echo "$options" | sed -E 's/from="([^"]*,)?user=[^",]+(,|")([^"]*)"/\1\2\3/')
+                [ -n "$from_user" ] && options="from=\"user=$from_user${options:+,$options}\""
+                ;;
+            4)
+                read -p "Enter host restriction (or press Enter to remove): " from_host
+                options=$(echo "$options" | sed -E 's/from="([^"]*,)?host=[^",]+(,|")([^"]*)"/\1\2\3/')
+                [ -n "$from_host" ] && options="from=\"host=$from_host${options:+,$options}\""
+                ;;
+            5)
+                read -p "Enter permitopen value (or press Enter to remove): " permitopen
+                options=$(echo "$options" | sed 's/permitopen="[^"]*"//')
+                [ -n "$permitopen" ] && options="permitopen=\"$permitopen\" $options"
+                ;;
+            6)
+                read -p "Enter environment variable (format: NAME=value, or press Enter to skip): " env_var
+                if [ -n "$env_var" ]; then
+                    options="environment=\"$env_var\" $options"
+                fi
+                ;;
+            7)
+                toggle_option "no-agent-forwarding"
+                ;;
+            8)
+                toggle_option "no-port-forwarding"
+                ;;
+            9)
+                toggle_option "no-X11-forwarding"
+                ;;
+            10)
+                toggle_option "no-pty"
+                ;;
+            11)
+                options=""
+                echo "All options removed."
+                ;;
+            "")
+                break
+                ;;
+            *)
+                error "Invalid choice. Please try again."
+                ;;
+        esac
+    done
+}
+
+toggle_option() {
+    local option=$1
+    if [[ $options == *"$option"* ]]; then
+        options=${options//$option/}
+        echo "$option removed."
+    else
+        options="$option $options"
+        echo "$option added."
+    fi
+    options=$(echo $options | xargs)  # Trim leading/trailing spaces
+}
+
+display_file_contents() {
+    local file="$1"
+    echo -e "\n${CYAN}File Contents:${NC}"
+    echo -e "${BLUE}═════════════════════════${NC}"
+    awk '{printf "%-5s %s\n", NR ":", $0}' "$file"
+    echo -e "${BLUE}═════════════════════════${NC}\n"
 }
 
 # Main script
 while true; do
     cleanup_and_update_ssh_config
     display_main_menu
-    read -p "$(echo -e "${BLUE}Choose an option (1/2/3/4/q): ${NC}")" option
+    read -p "$(echo -e "${BLUE}Choose an option (1/2/3/4/5/q): ${NC}")" option
     echo ""
 
     case "$option" in
@@ -927,10 +1395,11 @@ while true; do
         2) execute_or_simulate import_private_key ;;
         3) execute_or_simulate copy_pubkey_to_hosts ;;
         4) execute_or_simulate check_local_ssh_security ;;
+        5) display_settings_menu ;;  # Note: removed execute_or_simulate here
         q|Q) info "Exiting script. Goodbye!"; exit 0 ;;
         *) error "Invalid option. Please try again." ;;
     esac
 
     echo ""
-    read -p "Press Enter to return to the main menu..."
+    #read -p "Press Enter to return to the main menu..."
 done
