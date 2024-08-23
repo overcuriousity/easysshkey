@@ -34,10 +34,7 @@
 set -e
 # debug
 #set -x
-# debug
-#set -x
 
-# Configurable via menu globals
 # Configurable via menu globals
 sshd_config="/etc/ssh/sshd_config"
 ssh_keys_location="$HOME/.ssh/"
@@ -45,11 +42,7 @@ backup_dir="$HOME/.sshbackups/ssh_backup_$(date +%Y%m%d_%H%M%S)"
 agnostic_authorized_keys=true
 
 # Global variables
-agnostic_authorized_keys=true
-
-# Global variables
 dry_run=false
-override_security=false
 override_security=false
 
 # Color definitions
@@ -69,10 +62,6 @@ display_help() {
     echo "  -d, --dry-run              Run in dry-run mode (show changes without applying them)"
     echo "  -h, --help                 Display this help message"
     echo "  -o. --override-security    Overrides mandatory key passphrase for permissive keys"
-    echo "  -b, --backup               Create a backup of SSH configurations before making changes"
-    echo "  -d, --dry-run              Run in dry-run mode (show changes without applying them)"
-    echo "  -h, --help                 Display this help message"
-    echo "  -o. --override-security    Overrides mandatory key passphrase for permissive keys"
     exit 0
 }
 
@@ -83,12 +72,10 @@ while [[ $# -gt 0 ]]; do
             mkdir -p "$backup_dir"
             cp -r "$ssh_keys_location" "$backup_dir"
             info "Backup created in $backup_dir"
-            info "Backup created in $backup_dir"
             shift
             ;;
         -d|--dry-run)
             dry_run=true
-            info "Running in dry-run mode. No changes will be applied."
             info "Running in dry-run mode. No changes will be applied."
             shift
             ;;
@@ -98,11 +85,7 @@ while [[ $# -gt 0 ]]; do
         -o|--override-security)
             override_security=true
             ;;
-        -o|--override-security)
-            override_security=true
-            ;;
         *)
-            error "Unknown option: $1"
             error "Unknown option: $1"
             display_help
             ;;
@@ -186,16 +169,12 @@ generate_ssh_key() {
     
     if prompt_yes_no "Do you want to configure this key for a remote host? (Recommended)" "y"; then
         check_remote=true
-        check_remote=true
         read remote_host remote_user <<< $(prompt_remote_details)
         copy_key_to_remote "$key_name" "$remote_host" "$remote_user"
         success "Initial SSH login via password successful!"
         configure_remote_ssh "$remote_user" "$remote_host"
     fi
     configure_local_ssh "$key_name"
-    if [ "$check_remote" = true ]; then
-        check_remote_ssh_config "$remote_user" "$remote_host" "$ssh_keys_location$key_name"
-    fi
     if [ "$check_remote" = true ]; then
         check_remote_ssh_config "$remote_user" "$remote_host" "$ssh_keys_location$key_name"
     fi
@@ -218,7 +197,6 @@ select_key_type() {
             3) key_type="ecdsa"; break;;
             4) select_hardware_key_type; break;;
             *) error "Invalid choice. Please try again.";;
-            *) error "Invalid choice. Please try again.";;
         esac
     done
 }
@@ -226,14 +204,12 @@ select_key_type() {
 select_hardware_key_type() {
     echo -e "\n${CYAN}Select Hardware Key Type:${NC}"
     warn "This option requires the system packages openssh and libfido2 to be installed for your distribution!"
-    warn "This option requires the system packages openssh and libfido2 to be installed for your distribution!"
     echo "1. Ed25519-SK (Recommended if supported by your device)"
     echo "2. ECDSA-SK (Better compatibility with older hardware keys)"
     read -p "Enter your choice (1-2): " hw_key_choice
     case $hw_key_choice in
         1) key_type="ed25519-sk";;
         2) key_type="ecdsa-sk";;
-        *) error "Invalid choice. Please try again."; select_hardware_key_type;;
         *) error "Invalid choice. Please try again."; select_hardware_key_type;;
     esac
 }
@@ -257,43 +233,12 @@ select_key_size() {
                 2) key_size=$([ "$key_type" == "rsa" ] && echo "4096" || echo "384"); break;;
                 3) [ "$key_type" == "ecdsa" ] && { key_size="521"; break; } || error "Invalid choice for RSA. Please try again.";;
                 *) error "Invalid choice. Please try again.";;
-                3) [ "$key_type" == "ecdsa" ] && { key_size="521"; break; } || error "Invalid choice for RSA. Please try again.";;
-                *) error "Invalid choice. Please try again.";;
             esac
         done
     fi
 }
 
 select_passphrase_option() {
-    if [ "$agnostic_authorized_keys" != true ]; then
-        echo -e "\n${CYAN}Passphrase Option:${NC}"
-        echo "Using a passphrase adds an extra layer of security to your SSH key."
-        echo "+ Advantages: Protects the key if it's stolen or accessed by unauthorized users"
-        echo "- Disadvantages: You'll need to enter the passphrase each time you use the key (unless using ssh-agent)"
-        info "You have a choice here because of the current settings, which are restrictive - ${GREEN}remote hosts${NC} will be configured within their authorized hosts to ${GREEN}only accept connections with your given username/hostname${NC} configuration."
-        
-        if prompt_yes_no "Do you want to set a passphrase for your SSH key?" "n"; then
-            use_passphrase=true
-            info "You will be prompted to enter the passphrase during key generation."
-        else
-            use_passphrase=false
-            info "No passphrase will be set. Your key will not be password-protected - this is not a problem if you don't lose your key."
-        fi
-    else
-        if [ "$override_security" != true ]; then
-            info "Remote host configuration currently is ${GREEN}permissive${NC}, which allows you to ${GREEN}log in from any host as any user${NC}, as long as you have the keys."
-            info "${RED}If you happen to leak your private key, a malicious actor can log in as you would. Because of that, setting a passphrase to protect your private key is mandatory.${NC}"
-            info "If you want to change this setting, do so in the settings menu or the configuration variables (agnostic_authorized_keys=false)"
-            use_passphrase=true
-        else
-            if prompt_yes_no "Do you want to set a passphrase for your SSH key?" "n"; then
-                use_passphrase=true
-                info "You will be prompted to enter the passphrase during key generation."
-            else
-                use_passphrase=false
-                info "No passphrase will be set. Your key will not be password-protected - this is not a problem if you don't lose your key."
-            fi
-        fi
     if [ "$agnostic_authorized_keys" != true ]; then
         echo -e "\n${CYAN}Passphrase Option:${NC}"
         echo "Using a passphrase adds an extra layer of security to your SSH key."
@@ -336,7 +281,6 @@ select_key_name() {
             break
         else
             error "Key name must start with 'id_'. Please try again."
-            error "Key name must start with 'id_'. Please try again."
         fi
     done
 }
@@ -368,7 +312,6 @@ generate_hardware_key() {
     echo "Please insert your hardware security key and follow any prompts."
     if ! ssh-keygen -t $key_type -f "$ssh_keys_location$key_name" ${use_passphrase:+-N ""}; then
         error "Failed to generate hardware-backed key. This might be due to missing libfido2 library."
-        error "Failed to generate hardware-backed key. This might be due to missing libfido2 library."
         echo "For Debian-based systems, try installing it with:"
         echo "sudo apt update && sudo apt install libfido2-1"
         echo "For Arch-based systems, use:"
@@ -382,11 +325,6 @@ generate_ed25519_key() {
     local key_name="$1"
     local use_passphrase="$2"
 
-    if [ "$use_passphrase" = true ]; then
-        ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name"
-    else
-        ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name" -N ""
-    fi
     if [ "$use_passphrase" = true ]; then
         ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name"
     else
@@ -495,7 +433,6 @@ copy_pubkey_to_hosts() {
     key_name=$(basename "$pubkey_path" .pub)
     if [ $? -ne 0 ]; then
         error "Failed to select a valid public key. Exiting."
-        error "Failed to select a valid public key. Exiting."
         return 1
     fi
     configure_local_ssh "$key_name"
@@ -507,7 +444,6 @@ copy_pubkey_to_hosts() {
             break
         fi
         
-        info "Copying public key '$pubkey_path' to $remote_host..."
         info "Copying public key '$pubkey_path' to $remote_host..."
         copy_key_to_remote "$(basename "$pubkey_path" .pub)" "$remote_host" "$remote_user"
         
@@ -541,7 +477,6 @@ select_key_file() {
 
     if [ ${#files[@]} -eq 0 ]; then
         error "No $key_type keys found in ~/.ssh directory." >&2
-        error "No $key_type keys found in ~/.ssh directory." >&2
         selected_file=$(prompt_with_default "Enter path to $key_type key" "")
     else
         echo "Select a $key_type key:" >&2
@@ -562,7 +497,6 @@ select_key_file() {
                             break
                         else
                             error "Invalid selection or file not found. Please try again." >&2
-                            error "Invalid selection or file not found. Please try again." >&2
                         fi
                     fi
                     ;;
@@ -572,7 +506,6 @@ select_key_file() {
 
     # Verify that the selected file exists and is readable
     if [ ! -f "$selected_file" ] || [ ! -r "$selected_file" ]; then
-        error "The selected $key_type key file does not exist or is not readable: $selected_file" >&2
         error "The selected $key_type key file does not exist or is not readable: $selected_file" >&2
         return 1
     fi
@@ -587,7 +520,6 @@ copy_and_set_permissions() {
 
     if [[ "$source_path" != "$dest_path" ]]; then
         cp -f "$source_path" "$dest_path"
-        info "Private key copied to $dest_path"
         info "Private key copied to $dest_path"
     fi
 
@@ -674,7 +606,6 @@ EOF
 configure_local_ssh() {
     local key_name="$1"
     info "Configuring local SSH to use the new key..."
-    info "Configuring local SSH to use the new key..."
 
     # Set correct permissions for the private key file
     chmod 600 "$ssh_keys_location$key_name"
@@ -696,7 +627,6 @@ cleanup_and_update_ssh_config() {
     fi
 
     info "Updating SSH config..."
-    info "Updating SSH config..."
 
     # Ensure the .ssh directory exists
     mkdir -p "$ssh_keys_location"
@@ -704,9 +634,7 @@ cleanup_and_update_ssh_config() {
     # Generate public keys for all private keys
     find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
         #info "Generating public key for $key_file..."
-        #info "Generating public key for $key_file..."
         ssh-keygen -y -f "$key_file" > "${key_file}.pub"
-        #success "Public key generated/updated: ${key_file}.pub"
         #success "Public key generated/updated: ${key_file}.pub"
         chmod 644 "${key_file}.pub"
     done
@@ -749,7 +677,6 @@ cleanup_and_update_ssh_config() {
     chmod 600 "$ssh_config"
 
     info "SSH configuration update complete."
-    info "SSH configuration update complete."
     results[9]="PASS"
 }
 
@@ -759,14 +686,12 @@ check_remote_ssh_config() {
     local key_file="$3"
 
     info "Checking remote SSH configuration..."
-    info "Checking remote SSH configuration..."
 
     # Ensure we're using the private key, not the public key
     local private_key_file="${key_file%.pub}"
 
     # Check if the file exists
     if [ ! -f "$private_key_file" ]; then
-        error "Private key file $private_key_file does not exist."
         error "Private key file $private_key_file does not exist."
         return 1
     fi
