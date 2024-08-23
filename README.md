@@ -52,7 +52,8 @@ Follow the on-screen prompts to perform various SSH key management tasks.
 
 ## Security Considerations
 
-- The script may require sudo privileges for some operations. Review the code to understand what elevated actions it performs.
+- There is only one occasion where the script asks for your sudo password (fixing your local ssh security)
+- The script is deliberately unrestricted and allows maximum user freedom while providing hints for best-practices. Always consider your threat model.
 
 ## Compatibility
 
@@ -64,6 +65,8 @@ You can modify the following variables at the beginning of the script to customi
 
 - `sshd_config`: Location of the SSH daemon configuration file
 - `ssh_keys_location`: Directory where SSH keys are stored
+- `backup_dir`: Default destination  when making backups
+- `agnostic_authorized_keys`: By default, the script will configure remote hosts with a permissive `authorized_keys`file which will allow you to log in from everywhere with your private key. This can be changed.
 
 ## Contributing
 
