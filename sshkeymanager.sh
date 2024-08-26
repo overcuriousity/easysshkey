@@ -40,6 +40,7 @@ sshd_config="/etc/ssh/sshd_config"
 ssh_keys_location="$HOME/.ssh/"
 backup_dir="$HOME/.sshbackups/ssh_backup_$(date +%Y%m%d_%H%M%S)"
 agnostic_authorized_keys=true
+default_ssh_port="22"
 
 # Global variables
 dry_run=false
@@ -148,7 +149,9 @@ prompt_yes_no() {
 prompt_remote_details() {
     local remote_host=$(prompt_with_default "Enter remote host" "1.2.3.4")
     local remote_user=$(prompt_with_default "Enter remote user" "$USER")
-    echo "$remote_host $remote_user"
+    info "The following prompt is only relevant, if there is a different SSH-port configured for the remote host. Usually this can be left as it is."
+    local remote_port=$(prompt_with_default "Enter remote SSH-Port (usually 22)" "$default_ssh_port")
+    echo "$remote_host $remote_user" "$remote_port"
 }
 
 # Refactored generate_ssh_key function
@@ -169,14 +172,14 @@ generate_ssh_key() {
     
     if prompt_yes_no "Do you want to configure this key for a remote host? (Recommended)" "y"; then
         check_remote=true
-        read remote_host remote_user <<< $(prompt_remote_details)
-        copy_key_to_remote "$key_name" "$remote_host" "$remote_user"
+        read remote_host remote_user remote_port <<< $(prompt_remote_details)
+        copy_key_to_remote "$key_name" "$remote_host" "$remote_user" "$remote_port"
         success "Initial SSH login via password successful!"
-        configure_remote_ssh "$remote_user" "$remote_host"
+        configure_remote_ssh "$remote_user" "$remote_host" "$remote_port"
     fi
     configure_local_ssh "$key_name"
     if [ "$check_remote" = true ]; then
-        check_remote_ssh_config "$remote_user" "$remote_host" "$ssh_keys_location$key_name"
+        check_remote_ssh_config "$remote_user" "$remote_host" "$remote_port" "$ssh_keys_location$key_name"
     fi
     display_key_generation_summary "$key_type" "$use_passphrase"
 }
@@ -345,19 +348,20 @@ copy_key_to_remote() {
     local key_name="$1"
     local remote_host="$2"
     local remote_user="$3"
+    local remote_port="$4"
 
     info "Copying $ssh_keys_location$key_name.pub to $remote_host..."
 
     if [ "$agnostic_authorized_keys" = false ]; then
-        info "Running ssh-copy-id -f -i \"$ssh_keys_location$key_name.pub\" \"$remote_user@$remote_host\""
-        ssh-copy-id -f -i "$ssh_keys_location$key_name.pub" "$remote_user@$remote_host"
+        info "Running ssh-copy-id -f -i \"$ssh_keys_location$key_name.pub\" \"$remote_user@$remote_host\" -p \"$remote_port\""
+        ssh-copy-id -f -i "$ssh_keys_location$key_name.pub" "$remote_user@$remote_host" -p "$remote_port"
     else
         info "Adding key to authorized_keys without user/hostname restrictions"
         # Read the public key and remove the username@hostname part
         local pubkey=$(awk '{print $1 " " $2}' "$ssh_keys_location$key_name.pub")
         echo "$pubkey"
         # Append the key to the remote authorized_keys file
-        ssh "$remote_user@$remote_host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$pubkey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+        ssh "$remote_user@$remote_host" -p "$remote_port" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$pubkey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
     fi     
 }
 
@@ -403,14 +407,14 @@ import_private_key() {
         configure_local_ssh "$key_name"
         
         while true; do
-            read remote_host remote_user <<< $(prompt_remote_details)
+            read remote_host remote_user remote_port <<< $(prompt_remote_details)
             
             if [ -z "$remote_host" ]; then
                 break
             fi
             
-            configure_remote_ssh "$remote_user" "$remote_host"
-            check_remote_ssh_config "$remote_user" "$remote_host" "$destination_path"
+            configure_remote_ssh "$remote_user" "$remote_host" "$remote_port"
+            check_remote_ssh_config "$remote_user" "$remote_host" "$remote_port" "$destination_path"
             
             if ! prompt_yes_no "Do you want to configure this key for another host?" "n"; then
                 break
@@ -438,17 +442,17 @@ copy_pubkey_to_hosts() {
     configure_local_ssh "$key_name"
 
     while true; do
-        read remote_host remote_user <<< $(prompt_remote_details)
+        read remote_host remote_user remote_port <<< $(prompt_remote_details)
         
         if [ -z "$remote_host" ]; then
             break
         fi
         
         info "Copying public key '$pubkey_path' to $remote_host..."
-        copy_key_to_remote "$(basename "$pubkey_path" .pub)" "$remote_host" "$remote_user"
+        copy_key_to_remote "$(basename "$pubkey_path" .pub)" "$remote_host" "$remote_user" "$remote_port"
         
-        configure_remote_ssh "$remote_user" "$remote_host"
-        check_remote_ssh_config "$remote_user" "$remote_host" "$pubkey_path"
+        configure_remote_ssh "$remote_user" "$remote_host" "$remote_port"
+        check_remote_ssh_config "$remote_user" "$remote_host" "$remote_port" "$pubkey_path"
         #if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
         #    check_local_ssh_security
         #fi
@@ -538,10 +542,10 @@ configure_multiple_hosts() {
     done
     
     for host in "${hosts[@]}"; do
-        read remote_host remote_user <<< $(prompt_remote_details)
+        read remote_host remote_user remote_port <<< $(prompt_remote_details)
         
-        configure_remote_ssh "$remote_user" "$host"
-        check_remote_ssh_config "$remote_user" "$host" "$key_path"
+        configure_remote_ssh "$remote_user" "$host" "$remote_port"
+        check_remote_ssh_config "$remote_user" "$host" "$remote_port" "$key_path"
         if prompt_yes_no "Do you want to perform some checks for your local ssh security?" "n"; then
             check_local_ssh_security
         fi
@@ -553,6 +557,7 @@ configure_multiple_hosts() {
 configure_remote_ssh() {
     local remote_user="$1"
     local remote_host="$2"
+    local remote_port="$3"
 
     if prompt_yes_no "Attempt configuration of $remote_host to accept ssh pubkey? (This is not necessary when done before)" "n"; then
 
@@ -578,7 +583,7 @@ configure_remote_ssh() {
         
         if [ "$set_rhost_permissions" = true ]; then
             # First, perform non-sudo operations
-            ssh "$remote_user@$remote_host" bash << EOF
+            ssh "$remote_user@$remote_host" -p "$remote_port" bash << EOF
             chmod 700 ~/.ssh
             chmod 600 ~/.ssh/authorized_keys
             find ~/.ssh -name '*.pub' -type f -exec chmod 644 {} +
@@ -589,14 +594,14 @@ EOF
         if [ "$enable_pubkey_auth" = true ] || [ "$disable_password_auth" = true ]; then
             
             if [ "$enable_pubkey_auth" = true ]; then
-                ssh -t "$remote_user@$remote_host" "sudo sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config"
+                ssh -t "$remote_user@$remote_host" -p "$remote_port" "sudo sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config"
             fi
             
             if [ "$disable_password_auth" = true ]; then
-                ssh -t "$remote_user@$remote_host" "sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
+                ssh -t "$remote_user@$remote_host" -p "$remote_port" "sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
             fi
             
-            ssh -t "$remote_user@$remote_host" "sudo systemctl restart sshd.service"
+            ssh -t "$remote_user@$remote_host" -p "$remote_port" "sudo systemctl restart sshd.service"
         fi
 
         success "Remote SSH configuration completed for $remote_host."
@@ -683,7 +688,8 @@ cleanup_and_update_ssh_config() {
 check_remote_ssh_config() {
     local remote_user="$1"
     local remote_host="$2"
-    local key_file="$3"
+    local remote_port="$3"
+    local key_file="$4"
 
     info "Checking remote SSH configuration..."
 
@@ -700,7 +706,7 @@ check_remote_ssh_config() {
     chmod 600 "$private_key_file"
 
     # Perform non-sudo operations
-    ssh -i "$private_key_file" "$remote_user@$remote_host" bash << EOF
+    ssh -i "$private_key_file" "$remote_user@$remote_host" -p "$remote_port" bash << EOF
     echo "Checking ~/.ssh permissions..."
     ls -ld ~/.ssh
     ls -l ~/.ssh/authorized_keys
@@ -971,6 +977,8 @@ display_global_variables_menu() {
         echo "   CURRENT: $agnostic_authorized_keys"
         echo -e "${CYAN}4. Backup directory${NC}"
         echo "   CURRENT: $backup_dir"
+        echo -e "${CYAN}5. Default SSH Port${NC}"
+        echo "   CURRENT: $default_ssh_port"
         echo ""
         echo -e "${YELLOW}q. Return to Advanced Settings Menu${NC}"
         echo ""
@@ -1008,6 +1016,11 @@ display_global_variables_menu() {
                 read -p "Enter new backup dir pattern: " new_pattern
                 backup_dir="$new_pattern"
                 success "Backup dir pattern updated."
+                ;;
+            5)
+                read -p "Enter new default SSH Port: " new_port
+                default_ssh_port="$new_port"
+                success "Default SSH Port updated."
                 ;;
             q|Q)
                 return
@@ -1055,13 +1068,13 @@ backup_ssh_keys() {
 }
 
 manipulate_remote_pubkeyfile() {
-    local remote_host remote_user remote_file local_file
+    local remote_host remote_user remote_port remote_file local_file
 
     # Step 1: Get remote details and download the file
-    read remote_host remote_user <<< $(prompt_remote_details)
+    read remote_host remote_user remote_port <<< $(prompt_remote_details)
     remote_file="/home/$remote_user/.ssh/authorized_keys"
     local_file=$(mktemp)
-    if ! scp "$remote_user@$remote_host:$remote_file" "$local_file"; then
+    if ! scp -P "$remote_port" "$remote_user@$remote_host:$remote_file" "$local_file"; then
         error "Failed to download the remote file."
         return 1
     fi
@@ -1090,7 +1103,7 @@ manipulate_remote_pubkeyfile() {
         fi
     done
 
-    if scp "$local_file" "$remote_user@$remote_host:$remote_file"; then
+    if scp -P "$remote_port" "$local_file" "$remote_user@$remote_host:$remote_file"; then
         success "File successfully updated on the remote host."
     else
         error "Failed to upload the updated file to the remote host."
