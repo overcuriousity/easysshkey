@@ -149,7 +149,6 @@ prompt_yes_no() {
 prompt_remote_details() {
     local remote_host=$(prompt_with_default "Enter remote host" "1.2.3.4")
     local remote_user=$(prompt_with_default "Enter remote user" "$USER")
-    info "The following prompt is only relevant, if there is a different SSH-port configured for the remote host. Usually this can be left as it is."
     local remote_port=$(prompt_with_default "Enter remote SSH-Port (usually 22)" "$default_ssh_port")
     echo "$remote_host $remote_user" "$remote_port"
 }
