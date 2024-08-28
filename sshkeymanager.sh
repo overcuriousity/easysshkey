@@ -45,6 +45,8 @@ default_ssh_port="22"
 # Global variables
 dry_run=false
 override_security=false
+default_remote_ip="1.2.3.4"
+default_remote_user="$USER"
 
 # Color definitions
 RED='\033[0;31m'
@@ -150,6 +152,8 @@ prompt_remote_details() {
     local remote_host=$(prompt_with_default "Enter remote host" "1.2.3.4")
     local remote_user=$(prompt_with_default "Enter remote user" "$USER")
     local remote_port=$(prompt_with_default "Enter remote SSH-Port (usually 22)" "$default_ssh_port")
+    default_remote_ip="$remote_host"
+    default_remote_user="$remote_user"
     echo "$remote_host $remote_user" "$remote_port"
 }
 
