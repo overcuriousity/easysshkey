@@ -149,8 +149,8 @@ prompt_yes_no() {
 
 # New shared function for prompting remote host and user
 prompt_remote_details() {
-    local remote_host=$(prompt_with_default "Enter remote host" "1.2.3.4")
-    local remote_user=$(prompt_with_default "Enter remote user" "$USER")
+    local remote_host=$(prompt_with_default "Enter remote host" "$default_remote_ip")
+    local remote_user=$(prompt_with_default "Enter remote user" "$default_remote_user")
     local remote_port=$(prompt_with_default "Enter remote SSH-Port (usually 22)" "$default_ssh_port")
     default_remote_ip="$remote_host"
     default_remote_user="$remote_user"
