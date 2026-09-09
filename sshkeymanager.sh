@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # SSH Key Management Script
-# Version: 1.2
+# Version: 2.0
 #
 # This script provides a comprehensive set of tools for managing SSH keys and configurations.
 # It allows users to generate new SSH key pairs, import existing keys, configure remote hosts,
@@ -22,7 +22,7 @@
 # - Known hosts management
 #
 # Usage:
-#   ./ssh_key_manager.sh [options]
+#   sshkeymanager [options]
 #
 # Options:
 #   -b, --backup     Create a backup of SSH configurations before making changes
@@ -38,28 +38,41 @@
 #
 # Note: This script modifies system files and SSH configurations. Use with caution.
 
-# Exit on error
-set -e
+# Treat unset variables as an error and propagate failures through pipelines.
+#
+# NOTE: `set -e` is deliberately NOT enabled. This is a long-lived interactive
+# menu; under `set -e` a single non-zero return (a failed ssh, a grep that
+# matches nothing) would tear down the whole session mid-operation. Failures
+# are handled explicitly at each call site instead.
+set -uo pipefail
 # Uncomment for debugging
 #set -x
 
-# Configurable via menu globals
+# --- Configurable via the settings menu --------------------------------------
 sshd_config="/etc/ssh/sshd_config"
-ssh_keys_location="$HOME/.ssh/"
-backup_dir="$HOME/.sshbackups/ssh_backup_$(date +%Y%m%d_%H%M%S)"
+# No trailing slash. Paths are always composed as "$ssh_keys_location/<name>".
+ssh_keys_location="$HOME/.ssh"
+backup_root="$HOME/.sshbackups"
+backup_dir="$backup_root/ssh_backup_$(date +%Y%m%d_%H%M%S)"
 agnostic_authorized_keys=true
-default_ssh_port="22"
 audit_log="$HOME/.ssh_key_audit.log"
-known_hosts_file="$HOME/.ssh/known_hosts"
+known_hosts_file="$ssh_keys_location/known_hosts"
 
-# Global variables
+# --- Runtime state -----------------------------------------------------------
 dry_run=false
 override_security=false
 audit_mode=false
-default_remote_ip="1.2.3.4"
-default_remote_user="$USER"
+# Deliberately empty: a routable placeholder here means a stray Enter opens a
+# connection to a stranger's host.
+default_remote_ip=""
+default_remote_user="${USER:-$(id -un)}"
 default_ssh_port="22"
 check_remote=false
+# ~/.ssh/config is backed up at most once per session by
+# cleanup_and_update_ssh_config(); this tracks whether that has happened.
+ssh_config_backed_up=false
+# Temporary files registered for cleanup by the EXIT trap.
+declare -a _tmp_files=()
 
 # Color definitions
 RED='\033[0;31m'
@@ -74,7 +87,8 @@ NC='\033[0m' # No Color
 # Function to log operations for audit trail
 audit_log() {
     local message="$1"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] $message" >> "$audit_log"
 }
 
@@ -87,7 +101,7 @@ update_globals() {
 
 # Function to display help message
 display_help() {
-    echo "Usage: $0 [options]"
+    echo "Usage: $(basename "$0") [options]"
     echo
     echo "Options:"
     echo "  -b, --backup               Create a backup of SSH configurations before making changes"
@@ -97,39 +111,6 @@ display_help() {
     echo "  -a, --audit                Show audit log of key operations"
     exit 0
 }
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -b|--backup)
-            mkdir -p "$backup_dir"
-            cp -r "$ssh_keys_location" "$backup_dir"
-            info "Backup created in $backup_dir"
-            audit_log "Backup created in $backup_dir"
-            shift
-            ;;
-        -d|--dry-run)
-            dry_run=true
-            info "Running in dry-run mode. No changes will be applied."
-            shift
-            ;;
-        -h|--help)
-            display_help
-            ;;
-        -o|--override-security)
-            override_security=true
-            shift
-            ;;
-        -a|--audit)
-            audit_mode=true
-            shift
-            ;;
-        *)
-            error "Unknown option: $1"
-            display_help
-            ;;
-    esac
-done
 
 # Output functions
 info() {
@@ -154,10 +135,86 @@ debug() {
     fi
 }
 
+# --- Temporary file handling -------------------------------------------------
+# Every mktemp in this script goes through make_temp so that an abort (Ctrl-C,
+# a failed ssh, an unexpected exit) never leaves private key material or a
+# half-written authorized_keys behind in /tmp.
+make_temp() {
+    local t
+    t=$(mktemp "${TMPDIR:-/tmp}/sshkeymanager.XXXXXX") || return 1
+    chmod 600 "$t"
+    _tmp_files+=("$t")
+    printf '%s' "$t"
+}
+
+cleanup_temp_files() {
+    local t
+    for t in "${_tmp_files[@]+"${_tmp_files[@]}"}"; do
+        [ -n "$t" ] && rm -f "$t" "${t}.backup"
+    done
+    _tmp_files=()
+}
+trap cleanup_temp_files EXIT INT TERM
+
+# Strip trailing slashes from a directory path so that "$dir/$name" never
+# produces a doubled separator, and "$dir$name" can never silently concatenate.
+normalize_dir() {
+    local p="$1"
+    while [[ "$p" == */ && "$p" != "/" ]]; do
+        p="${p%/}"
+    done
+    printf '%s' "$p"
+}
+
+# --- Command line arguments --------------------------------------------------
+# Parsed here, *after* the output functions above are defined. When this block
+# lived at the top of the file it called info()/error() before they existed,
+# which aborted the script on every use of --backup, --dry-run and on any
+# unrecognised option.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--backup)
+            if mkdir -p "$backup_dir" && cp -a "$ssh_keys_location/." "$backup_dir/"; then
+                chmod -R go-rwx "$backup_dir"
+                info "Backup created in $backup_dir"
+                audit_log "Backup created in $backup_dir"
+            else
+                error "Failed to create backup in $backup_dir"
+                exit 1
+            fi
+            shift
+            ;;
+        -d|--dry-run)
+            dry_run=true
+            info "Running in dry-run mode. No changes will be applied."
+            shift
+            ;;
+        -h|--help)
+            display_help
+            ;;
+        -o|--override-security)
+            override_security=true
+            shift
+            ;;
+        -a|--audit)
+            audit_mode=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            error "Unknown option: $1"
+            display_help
+            ;;
+    esac
+done
+
 # Function to execute or simulate command based on dry-run mode
 execute_or_simulate() {
     if [ "$dry_run" = true ]; then
-        echo "Would execute: $@"
+        printf 'Would execute: %s\n' "$*"
     else
         "$@"
     fi
@@ -169,8 +226,12 @@ prompt_with_default() {
     local default="$2"
     local user_input
 
-    read -p "$(echo -e "${BLUE}$prompt${NC} [$default]: ")" user_input
-    echo "${user_input:-$default}"
+    if ! read -rp "$(echo -e "${BLUE}$prompt${NC} [$default]: ")" user_input; then
+        # stdin closed: fall back to the default rather than spinning.
+        printf '%s' "$default"
+        return 0
+    fi
+    printf '%s' "${user_input:-$default}"
 }
 
 # Helper function for yes/no prompts
@@ -180,7 +241,14 @@ prompt_yes_no() {
     local answer
 
     while true; do
-        read -p "$(echo -e "${YELLOW}$prompt${NC} [y/n] ($default): ")" answer
+        if ! read -rp "$(echo -e "${YELLOW}$prompt${NC} [y/n] ($default): ")" answer; then
+            # stdin closed: take the documented default.
+            answer="$default"
+            case $answer in
+                [Yy]* ) return 0;;
+                * ) return 1;;
+            esac
+        fi
         answer=${answer:-$default}
         case $answer in
             [Yy]* ) return 0;;
@@ -192,7 +260,7 @@ prompt_yes_no() {
 
 # Function to check SSH agent status
 check_ssh_agent() {
-    if [ -z "$SSH_AUTH_SOCK" ]; then
+    if [ -z "${SSH_AUTH_SOCK:-}" ]; then
         warn "SSH agent is not running."
         if prompt_yes_no "Would you like to start SSH agent?" "y"; then
             eval "$(ssh-agent -s)"
@@ -200,7 +268,8 @@ check_ssh_agent() {
         fi
     else
         info "SSH agent is running."
-        local key_count=$(ssh-add -l 2>/dev/null | grep -v "The agent has no identities" | wc -l)
+        local key_count
+        key_count=$(ssh-add -l 2>/dev/null | grep -cv "The agent has no identities")
         info "Keys loaded in agent: $key_count"
     fi
 }
@@ -209,20 +278,27 @@ check_ssh_agent() {
 add_key_to_agent() {
     local key_path="$1"
     
-    if [ -z "$SSH_AUTH_SOCK" ]; then
+    if [ -z "${SSH_AUTH_SOCK:-}" ]; then
         check_ssh_agent
     fi
     
-    if ssh-add -l | grep -q "$(ssh-keygen -lf "$key_path.pub" | awk '{print $2}')"; then
+    local fingerprint=""
+    if [ -f "$key_path.pub" ]; then
+        fingerprint=$(ssh-keygen -lf "$key_path.pub" 2>/dev/null | awk '{print $2}')
+    fi
+
+    # `ssh-add -l` exits 1 when the agent holds no identities, so its output has
+    # to be captured separately from its status.
+    local loaded
+    loaded=$(ssh-add -l 2>/dev/null) || loaded=""
+
+    if [ -n "$fingerprint" ] && printf '%s' "$loaded" | grep -qF -- "$fingerprint"; then
         info "Key already loaded in SSH agent."
+    elif ssh-add "$key_path"; then
+        success "Key added to SSH agent successfully."
     else
-        info "Adding key to SSH agent..."
-        ssh-add "$key_path"
-        if [ $? -eq 0 ]; then
-            success "Key added to SSH agent successfully."
-        else
-            error "Failed to add key to SSH agent."
-        fi
+        error "Failed to add key to SSH agent."
+        return 1
     fi
 }
 
@@ -236,11 +312,13 @@ display_key_fingerprint() {
         echo -e "${BLUE}═════════════════════════════${NC}"
         
         # SHA256 fingerprint (default)
-        local sha256_fp=$(ssh-keygen -lf "$pub_key_path" 2>/dev/null)
+        local sha256_fp
+        sha256_fp=$(ssh-keygen -lf "$pub_key_path" 2>/dev/null)
         echo -e "SHA256: $sha256_fp"
         
         # MD5 fingerprint (for compatibility)
-        local md5_fp=$(ssh-keygen -E md5 -lf "$pub_key_path" 2>/dev/null)
+        local md5_fp
+        md5_fp=$(ssh-keygen -E md5 -lf "$pub_key_path" 2>/dev/null)
         echo -e "MD5:    $md5_fp"
         
         # Visual fingerprint
@@ -295,7 +373,8 @@ manage_known_hosts() {
     fi
     
     info "Fetching host key..."
-    local temp_key=$(mktemp)
+    local temp_key
+    temp_key=$(make_temp) || { error "Could not create a temporary file."; return 1; }
     
     if ssh-keyscan -p "$remote_port" -t ed25519,ecdsa,rsa "$remote_host" > "$temp_key" 2>/dev/null; then
         echo -e "\n${CYAN}Host key fingerprints:${NC}"
@@ -331,24 +410,20 @@ configure_jump_host() {
             
             # Add to SSH config
             local ssh_config="$ssh_keys_location/config"
-            local temp_config=$(mktemp)
+            local temp_config
+            temp_config=$(make_temp) || { error "Could not create a temporary file."; return 1; }
             
             # Check if host already exists in config
-            if grep -q "^Host $target_host" "$ssh_config" 2>/dev/null; then
+            if config_has_host "$ssh_config" "$target_host"; then
                 warn "Host $target_host already exists in SSH config."
                 if prompt_yes_no "Update existing configuration?" "y"; then
-                    # Remove existing host block
-                    awk -v host="$target_host" '
-                        /^Host / && $2 == host { skip = 1; next }
-                        /^Host / && skip { skip = 0 }
-                        !skip { print }
-                    ' "$ssh_config" > "$temp_config"
+                    remove_host_block "$ssh_config" "$target_host" > "$temp_config"
                 else
                     rm -f "$temp_config"
                     return
                 fi
             else
-                [ -f "$ssh_config" ] && cp "$ssh_config" "$temp_config"
+                [ -f "$ssh_config" ] && cat "$ssh_config" > "$temp_config"
             fi
             
             # Add new host configuration
@@ -380,9 +455,15 @@ analyze_key_strength() {
     echo -e "\n${CYAN}Key Strength Analysis:${NC}"
     echo -e "${BLUE}═════════════════════════════${NC}"
     
-    local key_info=$(ssh-keygen -lf "$pub_key_path")
-    local key_bits=$(echo "$key_info" | awk '{print $1}')
-    local key_type=$(echo "$key_info" | awk '{print $4}' | tr -d '()')
+    local key_info key_bits key_type
+    if ! key_info=$(ssh-keygen -lf "$pub_key_path" 2>/dev/null); then
+        error "Could not read key information from $pub_key_path"
+        return 1
+    fi
+    key_bits=$(printf '%s' "$key_info" | awk '{print $1}')
+    # The type is the last field. Using $4 broke for any key whose comment
+    # contains a space, which is the default for keys made elsewhere.
+    key_type=$(printf '%s' "$key_info" | awk '{print $NF}' | tr -d '()')
     
     echo "Key Type: $key_type"
     echo "Key Size: $key_bits bits"
@@ -419,8 +500,10 @@ analyze_key_strength() {
     # Check key age
     local key_age_days=0
     if [ -f "$key_path" ]; then
-        local key_modified=$(stat -c %Y "$key_path" 2>/dev/null || stat -f %m "$key_path" 2>/dev/null)
-        local current_time=$(date +%s)
+        local key_modified
+        key_modified=$(stat -c %Y "$key_path" 2>/dev/null || stat -f %m "$key_path" 2>/dev/null)
+        local current_time
+        current_time=$(date +%s)
         key_age_days=$(( (current_time - key_modified) / 86400 ))
         
         echo -e "\nKey Age: $key_age_days days"
@@ -440,15 +523,16 @@ rotate_ssh_key() {
     echo -e "\n${GREEN}SSH Key Rotation${NC}"
     echo -e "${BLUE}═════════════════════════${NC}\n"
     
-    old_key_path=$(select_key_file "private key to rotate" "$ssh_keys_location/id_rsa" "id_*" "false")
-    if [ $? -ne 0 ]; then
+    if ! old_key_path=$(select_key_file "private key to rotate" "$ssh_keys_location/id_rsa" "id_*" "false"); then
         error "Failed to select a key for rotation."
         return 1
     fi
     
-    local old_key_name=$(basename "$old_key_path")
+    local old_key_name
+    old_key_name=$(basename "$old_key_path")
     local new_key_name="${old_key_name}_new"
-    local backup_key_name="${old_key_name}_old_$(date +%Y%m%d_%H%M%S)"
+    local backup_key_name
+    backup_key_name="${old_key_name}_old_$(date +%Y%m%d_%H%M%S)"
     
     info "Rotating key: $old_key_name"
     
@@ -456,76 +540,194 @@ rotate_ssh_key() {
     analyze_key_strength "$old_key_path"
     
     # Generate new key with same type
-    local old_key_type=$(ssh-keygen -lf "${old_key_path}.pub" | awk '{print $4}' | tr -d '()' | tr '[:upper:]' '[:lower:]')
+    local old_key_type
+    old_key_type=$(ssh-keygen -lf "${old_key_path}.pub" 2>/dev/null | awk '{print $NF}' | tr -d '()' | tr '[:upper:]' '[:lower:]')
+    if [ -z "$old_key_type" ]; then
+        error "Could not determine the type of $old_key_path (is ${old_key_path}.pub present?)"
+        return 1
+    fi
     
     info "Generating new key of type: $old_key_type"
     
     # Generate new key
     if [ "$old_key_type" == "ed25519" ]; then
-        ssh-keygen -t ed25519 -f "$ssh_keys_location$new_key_name" -N ""
+        ssh-keygen -t ed25519 -f "$ssh_keys_location/$new_key_name" -N ""
     elif [ "$old_key_type" == "rsa" ]; then
-        local key_bits=$(ssh-keygen -lf "${old_key_path}.pub" | awk '{print $1}')
-        ssh-keygen -t rsa -b "$key_bits" -f "$ssh_keys_location$new_key_name" -N ""
+        local key_bits
+        key_bits=$(ssh-keygen -lf "${old_key_path}.pub" | awk '{print $1}')
+        ssh-keygen -t rsa -b "$key_bits" -f "$ssh_keys_location/$new_key_name" -N ""
     else
-        ssh-keygen -t "$old_key_type" -f "$ssh_keys_location$new_key_name" -N ""
+        ssh-keygen -t "$old_key_type" -f "$ssh_keys_location/$new_key_name" -N ""
     fi
     
-    if [ $? -eq 0 ]; then
-        success "New key generated successfully."
-        
+    if [ ! -f "$ssh_keys_location/$new_key_name" ]; then
+        error "Failed to generate new key."
+        return 1
+    fi
+
+    success "New key generated successfully."
+    {
         # Display new key fingerprint
-        display_key_fingerprint "$ssh_keys_location$new_key_name"
+        display_key_fingerprint "$ssh_keys_location/$new_key_name"
         
         if prompt_yes_no "Deploy new key to all hosts that use the old key?" "y"; then
-            # Find hosts that use this key
-            local ssh_config="$ssh_keys_location/config"
+            # Resolved through `ssh -G` per host rather than by grepping five
+            # lines of context around an IdentityFile match, which missed hosts
+            # whose IdentityFile sat further down the block and matched keys
+            # whose names merely shared a prefix.
             local hosts=()
-            
-            if [ -f "$ssh_config" ]; then
-                # Extract hosts that use this identity file
-                hosts=($(grep -B5 "IdentityFile.*$old_key_name" "$ssh_config" | grep "^Host " | awk '{print $2}' | grep -v "\*"))
-            fi
+            mapfile -t hosts < <(hosts_using_key "$old_key_name")
             
             if [ ${#hosts[@]} -eq 0 ]; then
                 warn "No specific hosts found in SSH config for this key."
                 if prompt_yes_no "Deploy to default remote host?" "y"; then
-                    read remote_host remote_user remote_port <<< $(prompt_remote_details)
-                    copy_key_to_remote "$new_key_name" "$remote_host" "$remote_user" "$remote_port"
+                    if prompt_remote_details; then
+                        copy_key_to_remote "$new_key_name" "$remote_host" "$remote_user" "$remote_port" || true
+                    else
+                        warn "No host given; new key was not deployed anywhere."
+                    fi
                 fi
             else
                 for host in "${hosts[@]}"; do
                     info "Deploying to host: $host"
-                    # This is simplified - in reality, you'd need to parse the config for user/port
-                    read remote_host remote_user remote_port <<< $(prompt_remote_details)
-                    copy_key_to_remote "$new_key_name" "$remote_host" "$remote_user" "$remote_port"
+                    # Take User/Port/HostName from that host's own config block
+                    # instead of re-prompting for details and then ignoring the
+                    # host we are supposedly deploying to.
+                    remote_host=$(ssh_config_value "$host" hostname)
+                    remote_user=$(ssh_config_value "$host" user)
+                    remote_port=$(ssh_config_value "$host" port)
+                    [ -n "$remote_host" ] || remote_host="$host"
+                    [ -n "$remote_user" ] || remote_user="$default_remote_user"
+                    [ -n "$remote_port" ] || remote_port="$default_ssh_port"
+                    info "  -> $remote_user@$remote_host:$remote_port"
+                    copy_key_to_remote "$new_key_name" "$remote_host" "$remote_user" "$remote_port" || \
+                        warn "Deployment to $host failed; continuing."
                 done
             fi
             
-            # Backup old key
-            mv "$old_key_path" "$ssh_keys_location$backup_key_name"
-            mv "${old_key_path}.pub" "$ssh_keys_location${backup_key_name}.pub"
-            
-            # Rename new key to old key name
-            mv "$ssh_keys_location$new_key_name" "$old_key_path"
-            mv "$ssh_keys_location${new_key_name}.pub" "${old_key_path}.pub"
-            
-            success "Key rotation completed. Old key backed up as: $backup_key_name"
-            audit_log "Key rotated: $old_key_name -> backed up as $backup_key_name"
         fi
-    else
-        error "Failed to generate new key."
-    fi
+
+        # The swap happens whether or not deployment ran: leaving the new key
+        # parked under a "_new" suffix left the rotation half-finished.
+        if prompt_yes_no "Swap the new key into place (old key kept as $backup_key_name)?" "y"; then
+            mv "$old_key_path" "$ssh_keys_location/$backup_key_name"
+            mv "${old_key_path}.pub" "$ssh_keys_location/${backup_key_name}.pub"
+            mv "$ssh_keys_location/$new_key_name" "$old_key_path"
+            mv "$ssh_keys_location/${new_key_name}.pub" "${old_key_path}.pub"
+
+            success "Key rotation completed. Old key backed up as: $backup_key_name"
+            warn "Remove $backup_key_name from every host's authorized_keys once the new key is confirmed working."
+            audit_log "Key rotated: $old_key_name -> backed up as $backup_key_name"
+        else
+            info "New key left in place as $new_key_name; nothing was replaced."
+        fi
+    }
 }
 
+# Does ~/.ssh/config declare this exact Host alias?
+#
+# The old `grep -q "^Host $host"` treated the hostname as a regular expression,
+# so "web.example.com" matched "webXexample.com", and it also matched any host
+# that merely shared a prefix.
+config_has_host() {
+    local ssh_config="$1" host="$2"
+    [ -f "$ssh_config" ] || return 1
+    list_config_hosts_in "$ssh_config" | grep -qxF -- "$host"
+}
+
+list_config_hosts_in() {
+    local ssh_config="$1"
+    [ -f "$ssh_config" ] || return 0
+    awk '
+        /^[[:space:]]*[Hh]ost[[:space:]]/ {
+            for (i = 2; i <= NF; i++) {
+                if ($i !~ /[*?!]/) print $i
+            }
+        }
+    ' "$ssh_config" | awk '!seen[$0]++'
+}
+
+# Strip one Host block from a config, writing the result to stdout.
+#
+# Compares alias names as literal strings and understands Host lines that
+# declare several aliases: removing "web" from `Host web staging` leaves
+# `Host staging` rather than deleting the block other names still depend on.
+remove_host_block() {
+    local ssh_config="$1" host="$2"
+    [ -f "$ssh_config" ] || return 0
+    awk -v target="$host" '
+        function is_host_line(l) { return l ~ /^[[:space:]]*[Hh]ost[[:space:]]/ }
+        is_host_line($0) {
+            skip = 0
+            kept = ""
+            n = 0
+            for (i = 2; i <= NF; i++) {
+                if ($i != target) { kept = kept " " $i; n++ }
+            }
+            if (n == NF - 1) { print; next }      # target not present, keep as-is
+            if (n == 0)      { skip = 1; next }   # block belonged solely to target
+            print "Host" kept                      # drop just this alias
+            next
+        }
+        { if (!skip) print }
+    ' "$ssh_config"
+}
+
+# Resolve one effective ssh_config value for a host.
+#
+# `ssh -G` applies the same matching, Include handling and precedence rules the
+# client itself uses, which hand-parsing the file with grep/awk does not.
+ssh_config_value() {
+    local host="$1" key="$2"
+    ssh -G "$host" 2>/dev/null \
+        | awk -v k="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" \
+              '$1 == k { print $2; exit }'
+}
+
+# List the concrete Host aliases declared in ~/.ssh/config.
+#
+# A single Host line may declare several aliases; patterns containing globs and
+# negations are skipped because they cannot be connected to directly.
+list_config_hosts() {
+    list_config_hosts_in "$ssh_keys_location/config"
+}
+
+# Every host block whose IdentityFile refers to the given key file.
+hosts_using_key() {
+    local key_basename="$1" host idf
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        idf=$(ssh_config_value "$host" identityfile)
+        case "$idf" in
+            *"$key_basename") printf '%s\n' "$host" ;;
+        esac
+    done < <(list_config_hosts)
+}
+
+# Collect remote connection details.
+#
+# Assigns remote_host / remote_user / remote_port in the caller's scope and
+# returns non-zero when no host was given. The previous version echoed the three
+# values space-separated for `read` to split, which silently shifted every field
+# by one whenever the host was left empty.
 prompt_remote_details() {
-    local remote_host=$(prompt_with_default "Enter remote host" "$default_remote_ip")
-    local remote_user=$(prompt_with_default "Enter remote user" "$default_remote_user")
-    local remote_port=$(prompt_with_default "Enter remote SSH-Port (usually 22)" "$default_ssh_port")
-    
-    # Update the global variables
+    remote_host=$(prompt_with_default "Enter remote host (blank to stop)" "$default_remote_ip")
+    if [ -z "$remote_host" ]; then
+        return 1
+    fi
+    remote_user=$(prompt_with_default "Enter remote user" "$default_remote_user")
+
+    while true; do
+        remote_port=$(prompt_with_default "Enter remote SSH-Port (usually 22)" "$default_ssh_port")
+        if [[ "$remote_port" =~ ^[0-9]+$ ]] && [ "$remote_port" -ge 1 ] && [ "$remote_port" -le 65535 ]; then
+            break
+        fi
+        error "Port must be a number between 1 and 65535."
+    done
+
+    # Remember them as the defaults for the next prompt.
     update_globals "$remote_host" "$remote_user" "$remote_port"
-    
-    echo "$remote_host $remote_user $remote_port"
+    return 0
 }
 
 # Refactored generate_ssh_key function
@@ -545,40 +747,54 @@ generate_ssh_key() {
     generate_key "$key_type" "$key_size" "$key_name" "$use_passphrase"
     
     # Display key fingerprint
-    display_key_fingerprint "$ssh_keys_location$key_name"
+    display_key_fingerprint "$ssh_keys_location/$key_name"
     
     # Analyze key strength
-    analyze_key_strength "$ssh_keys_location$key_name"
+    analyze_key_strength "$ssh_keys_location/$key_name"
     
     if prompt_yes_no "Add this key to SSH agent?" "y"; then
-        add_key_to_agent "$ssh_keys_location$key_name"
+        add_key_to_agent "$ssh_keys_location/$key_name"
     fi
     
     if prompt_yes_no "Do you want to configure this key for a remote host? (Recommended)" "y"; then
+        if ! prompt_remote_details; then
+            warn "No host given; skipping remote configuration."
+            check_remote=false
+            configure_local_ssh "$key_name"
+            display_key_generation_summary "$key_type" "$use_passphrase"
+            audit_log "Generated new $key_type key: $key_name"
+            return 0
+        fi
         check_remote=true
-        read remote_host remote_user remote_port <<< $(prompt_remote_details)
         
         # Manage known hosts
         manage_known_hosts "$remote_host" "$remote_port"
         
-        # Copy key to remote
-        copy_key_to_remote "$key_name" "$remote_host" "$remote_user" "$remote_port"
-        success "Initial SSH login via password successful!"
+        # Copy key to remote. The old code announced success unconditionally,
+        # even when the copy had just failed.
+        if copy_key_to_remote "$key_name" "$remote_host" "$remote_user" "$remote_port"; then
+            success "Public key installed on $remote_host."
+        else
+            error "Could not install the public key on $remote_host."
+            if ! prompt_yes_no "Continue configuring this host anyway?" "n"; then
+                return 1
+            fi
+        fi
         
         # Configure jump host if needed
         configure_jump_host "$remote_host"
         
         # Configure remote SSH
-        configure_remote_ssh "$remote_user" "$remote_host" "$remote_port"
+        configure_remote_ssh "$remote_user" "$remote_host" "$remote_port" "$ssh_keys_location/$key_name"
         
         # Test connection
-        test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "$ssh_keys_location$key_name"
+        test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "$ssh_keys_location/$key_name" || true
     fi
     
     configure_local_ssh "$key_name"
     
     if [ "$check_remote" = true ]; then
-        check_remote_ssh_config "$remote_user" "$remote_host" "$remote_port" "$ssh_keys_location$key_name"
+        check_remote_ssh_config "$remote_user" "$remote_host" "$remote_port" "$ssh_keys_location/$key_name"
     fi
     
     display_key_generation_summary "$key_type" "$use_passphrase"
@@ -595,7 +811,9 @@ select_key_type() {
     echo "4. FIDO2 Hardware Key (Ed25519-SK or ECDSA-SK)"
     
     while true; do
-        read -p "Enter your choice (1-4): " key_type_choice
+        if ! read -rp "Enter your choice (1-4): " key_type_choice; then
+            key_type="ed25519"; break
+        fi
         case $key_type_choice in
             1) key_type="ed25519"; break;;
             2) key_type="rsa"; break;;
@@ -611,7 +829,7 @@ select_hardware_key_type() {
     warn "This option requires the system packages openssh and libfido2 to be installed for your distribution!"
     echo "1. Ed25519-SK (Recommended if supported by your device)"
     echo "2. ECDSA-SK (Better compatibility with older hardware keys)"
-    read -p "Enter your choice (1-2): " hw_key_choice
+    read -rp "Enter your choice (1-2): " hw_key_choice
     case $hw_key_choice in
         1) key_type="ed25519-sk";;
         2) key_type="ecdsa-sk";;
@@ -627,7 +845,9 @@ select_key_size() {
         echo "3. 4096 bits (Maximum security)"
         
         while true; do
-            read -p "Enter your choice: " key_size_choice
+            if ! read -rp "Enter your choice: " key_size_choice; then
+                key_size_choice=1
+            fi
             case $key_size_choice in
                 1) key_size="2048"; break;;
                 2) key_size="3072"; break;;
@@ -642,7 +862,9 @@ select_key_size() {
         echo "3. 521 bits (Maximum security)"
         
         while true; do
-            read -p "Enter your choice: " key_size_choice
+            if ! read -rp "Enter your choice: " key_size_choice; then
+                key_size_choice=1
+            fi
             case $key_size_choice in
                 1) key_size="256"; break;;
                 2) key_size="384"; break;;
@@ -690,20 +912,24 @@ select_key_name() {
     echo -e "\n${CYAN}Enter Key Name:${NC}"
     warn "The name should begin with 'id_' to be compatible with this script."
     echo "Example: id_${key_type}_$(hostname)_$(date +%Y%m)"
-    
-    local suggested_name="id_${key_type}_$(hostname | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')_$(date +%Y%m)"
-    
+
+    local suggested_name
+    suggested_name="id_${key_type}_$(hostname | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')_$(date +%Y%m)"
+
     while true; do
         key_name=$(prompt_with_default "Key name" "$suggested_name")
-        if [[ $key_name == id_* ]]; then
-            if [ -f "$ssh_keys_location$key_name" ]; then
-                error "Key with this name already exists. Please choose a different name."
-            else
-                break
-            fi
-        else
-            error "Key name must start with 'id_'. Please try again."
+        # The name becomes a filename and is interpolated into ssh-keygen
+        # arguments, so restrict it to characters that cannot be mistaken for
+        # a path component or shell syntax.
+        if [[ ! "$key_name" =~ ^id_[A-Za-z0-9._-]+$ ]]; then
+            error "Key name must start with 'id_' and contain only letters, digits, '.', '_' or '-'."
+            continue
         fi
+        if [ -e "$ssh_keys_location/$key_name" ] || [ -e "$ssh_keys_location/$key_name.pub" ]; then
+            error "Key with this name already exists. Please choose a different name."
+            continue
+        fi
+        break
     done
 }
 
@@ -722,8 +948,8 @@ generate_key() {
         generate_standard_key "$key_type" "$key_size" "$key_name" "$use_passphrase"
     fi
 
-    chmod 600 "$ssh_keys_location$key_name"
-    chmod 644 "$ssh_keys_location$key_name.pub"
+    chmod 600 "$ssh_keys_location/$key_name"
+    chmod 644 "$ssh_keys_location/$key_name.pub"
 }
 
 generate_hardware_key() {
@@ -732,14 +958,16 @@ generate_hardware_key() {
     local use_passphrase="$3"
 
     echo "Please insert your hardware security key and follow any prompts."
-    
-    # Fixed passphrase handling
-    local passphrase_args=""
+
+    # Built as an array and invoked directly. The previous implementation went
+    # through `eval`, so a key name containing shell metacharacters was executed
+    # rather than treated as a filename.
+    local -a keygen_args=(-t "$key_type" -f "$ssh_keys_location/$key_name")
     if [ "$use_passphrase" != true ]; then
-        passphrase_args="-N \"\""
+        keygen_args+=(-N "")
     fi
-    
-    if ! eval "ssh-keygen -t $key_type -f \"$ssh_keys_location$key_name\" $passphrase_args"; then
+
+    if ! ssh-keygen "${keygen_args[@]}"; then
         error "Failed to generate hardware-backed key. This might be due to missing libfido2 library."
         echo "For Debian-based systems, try installing it with:"
         echo "sudo apt update && sudo apt install libfido2-1 libfido2-dev openssh-client"
@@ -757,9 +985,9 @@ generate_ed25519_key() {
     local use_passphrase="$2"
 
     if [ "$use_passphrase" = true ]; then
-        ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
+        ssh-keygen -t ed25519 -f "$ssh_keys_location/$key_name" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
     else
-        ssh-keygen -t ed25519 -f "$ssh_keys_location$key_name" -N "" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
+        ssh-keygen -t ed25519 -f "$ssh_keys_location/$key_name" -N "" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
     fi
 }
 
@@ -771,9 +999,9 @@ generate_standard_key() {
 
     # Fixed passphrase handling
     if [ "$use_passphrase" = true ]; then
-        ssh-keygen -t "$key_type" -b "$key_size" -f "$ssh_keys_location$key_name" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
+        ssh-keygen -t "$key_type" -b "$key_size" -f "$ssh_keys_location/$key_name" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
     else
-        ssh-keygen -t "$key_type" -b "$key_size" -f "$ssh_keys_location$key_name" -N "" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
+        ssh-keygen -t "$key_type" -b "$key_size" -f "$ssh_keys_location/$key_name" -N "" -C "$(whoami)@$(hostname)-$(date +%Y%m%d)"
     fi
 }
 
@@ -783,15 +1011,16 @@ copy_key_to_remote() {
     local remote_user="$3"
     local remote_port="$4"
 
-    info "Copying $ssh_keys_location$key_name.pub to $remote_host..."
+    info "Copying $ssh_keys_location/$key_name.pub to $remote_host..."
 
     if [ "$agnostic_authorized_keys" = false ]; then
         info "Running ssh-copy-id with user/hostname restrictions..."
-        ssh-copy-id -f -i "$ssh_keys_location$key_name.pub" "$remote_user@$remote_host" -p "$remote_port"
+        ssh-copy-id -f -i "$ssh_keys_location/$key_name.pub" "$remote_user@$remote_host" -p "$remote_port"
     else
         info "Adding key to authorized_keys without user/hostname restrictions"
         # Read the public key and preserve all parts including comment
-        local pubkey=$(cat "$ssh_keys_location$key_name.pub")
+        local pubkey
+        pubkey=$(cat "$ssh_keys_location/$key_name.pub")
         
         # Use a more robust method to add the key
         if echo "$pubkey" | ssh "$remote_user@$remote_host" -p "$remote_port" \
@@ -813,7 +1042,8 @@ configure_per_host_ssh() {
     local key_path="$4"
     
     local ssh_config="$ssh_keys_location/config"
-    local temp_config=$(mktemp)
+    local temp_config
+    temp_config=$(make_temp) || { error "Could not create a temporary file."; return 1; }
     
     info "Configuring SSH for host: $host"
     
@@ -824,20 +1054,15 @@ configure_per_host_ssh() {
     fi
     
     # Check if host already exists
-    if grep -q "^Host $host" "$ssh_config" 2>/dev/null; then
+    if config_has_host "$ssh_config" "$host"; then
         warn "Host $host already exists in SSH config."
         if ! prompt_yes_no "Update existing configuration?" "y"; then
             rm -f "$temp_config"
             return
         fi
-        # Remove existing host block
-        awk -v host="$host" '
-            /^Host / && $2 == host { skip = 1; next }
-            /^Host / && skip { skip = 0 }
-            !skip { print }
-        ' "$ssh_config" > "$temp_config"
+        remove_host_block "$ssh_config" "$host" > "$temp_config"
     else
-        cp "$ssh_config" "$temp_config"
+        cat "$ssh_config" > "$temp_config"
     fi
     
     # Add host configuration
@@ -903,15 +1128,18 @@ import_private_key() {
     local key_name
     local destination_path
 
+    local private_key_path
     while true; do
-        local private_key_path=$(select_key_file "private" "$ssh_keys_location/id_rsa" "id_*" "false")
-        if [ $? -ne 0 ]; then
-            error "Failed to select a valid private key. Exiting."
+        # `local x=$(cmd)` returns the exit status of `local`, not of the
+        # command, so declaration and assignment must stay separate for the
+        # error check below to mean anything.
+        if ! private_key_path=$(select_key_file "private" "$ssh_keys_location/id_rsa" "id_*" "false"); then
+            error "Failed to select a valid private key."
             return 1
         fi
         
         key_name=$(basename "$private_key_path")
-        destination_path="$ssh_keys_location$key_name"
+        destination_path="$ssh_keys_location/$key_name"
         
         copy_and_set_permissions "$private_key_path" "$destination_path"
         
@@ -927,11 +1155,7 @@ import_private_key() {
         configure_local_ssh "$key_name"
         
         while true; do
-            read remote_host remote_user remote_port <<< $(prompt_remote_details)
-            
-            if [ -z "$remote_host" ]; then
-                break
-            fi
+            prompt_remote_details || break
             
             # Configure per-host SSH settings
             configure_per_host_ssh "$remote_host" "$remote_user" "$remote_port" "$destination_path"
@@ -939,11 +1163,11 @@ import_private_key() {
             # Manage known hosts
             manage_known_hosts "$remote_host" "$remote_port"
             
-            configure_remote_ssh "$remote_user" "$remote_host" "$remote_port"
+            configure_remote_ssh "$remote_user" "$remote_host" "$remote_port" "$destination_path"
             check_remote_ssh_config "$remote_user" "$remote_host" "$remote_port" "$destination_path"
             
             # Test connection
-            test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "$destination_path"
+            test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "$destination_path" || true
             
             if ! prompt_yes_no "Do you want to configure this key for another host?" "n"; then
                 break
@@ -962,12 +1186,14 @@ import_private_key() {
 copy_pubkey_to_hosts() {
     local pubkey_path
 
-    pubkey_path=$(select_key_file "public" "$ssh_keys_location/id_*.pub" "id_*.pub" "true")
-    key_name=$(basename "$pubkey_path" .pub)
-    if [ $? -ne 0 ]; then
-        error "Failed to select a valid public key. Exiting."
+    # The status check has to happen before anything else runs, or $? belongs
+    # to that other command instead.
+    if ! pubkey_path=$(select_key_file "public" "$ssh_keys_location/id_*.pub" "id_*.pub" "true"); then
+        error "Failed to select a valid public key."
         return 1
     fi
+    local key_name
+    key_name=$(basename "$pubkey_path" .pub)
     
     # Display key information
     display_key_fingerprint "${pubkey_path%.pub}"
@@ -975,11 +1201,7 @@ copy_pubkey_to_hosts() {
     configure_local_ssh "$key_name"
 
     while true; do
-        read remote_host remote_user remote_port <<< $(prompt_remote_details)
-        
-        if [ -z "$remote_host" ]; then
-            break
-        fi
+        prompt_remote_details || break
         
         # Manage known hosts
         manage_known_hosts "$remote_host" "$remote_port"
@@ -990,11 +1212,11 @@ copy_pubkey_to_hosts() {
         # Configure per-host SSH settings
         configure_per_host_ssh "$remote_host" "$remote_user" "$remote_port" "${pubkey_path%.pub}"
         
-        configure_remote_ssh "$remote_user" "$remote_host" "$remote_port"
+        configure_remote_ssh "$remote_user" "$remote_host" "$remote_port" "${pubkey_path%.pub}"
         check_remote_ssh_config "$remote_user" "$remote_host" "$remote_port" "$pubkey_path"
         
         # Test connection
-        test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "${pubkey_path%.pub}"
+        test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "${pubkey_path%.pub}" || true
         
         if ! prompt_yes_no "Do you want to copy the key to another host?" "n"; then
             break
@@ -1004,7 +1226,7 @@ copy_pubkey_to_hosts() {
 
 select_key_file() {
     local key_type="$1"
-    local default_path="$2"
+    local default_path="$2"   # offered when the user chooses to type a path
     local file_pattern="$3"
     local include_pub="$4"
     local files=()
@@ -1020,13 +1242,13 @@ select_key_file() {
 
     if [ ${#files[@]} -eq 0 ]; then
         error "No $key_type keys found in ~/.ssh directory." >&2
-        selected_file=$(prompt_with_default "Enter path to $key_type key" "")
+        selected_file=$(prompt_with_default "Enter path to $key_type key" "$default_path")
     else
         echo "Select a $key_type key:" >&2
         select file in "${files[@]}" "Enter path manually"; do
             case $file in
                 "Enter path manually")
-                    selected_file=$(prompt_with_default "Enter path to $key_type key" "")
+                    selected_file=$(prompt_with_default "Enter path to $key_type key" "$default_path")
                     break
                     ;;
                 *)
@@ -1035,8 +1257,8 @@ select_key_file() {
                         break
                     else
                         # Check if the input is a valid path
-                        if [ -f "$REPLY" ]; then
-                            selected_file="$REPLY"
+                        if [ -f "${REPLY:-}" ]; then
+                            selected_file="${REPLY:-}"
                             break
                         else
                             error "Invalid selection or file not found. Please try again." >&2
@@ -1076,10 +1298,18 @@ copy_and_set_permissions() {
     fi
 }
 
+# Remote sshd hardening.
+#
+# Directives are applied through a drop-in under /etc/ssh/sshd_config.d when the
+# remote sshd Includes that directory, and appended to the main config only as a
+# fallback. The previous sed-only approach silently did nothing when a directive
+# was absent from the file, or was overridden by a drop-in, while still
+# reporting success.
 configure_remote_ssh() {
     local remote_user="$1"
     local remote_host="$2"
     local remote_port="$3"
+    local key_path="${4:-}"
 
     if prompt_yes_no "Attempt configuration of $remote_host to accept ssh pubkey? (This is not necessary when done before)" "n"; then
 
@@ -1114,29 +1344,81 @@ configure_remote_ssh() {
 EOF
         fi
 
-        # Now, perform sudo operations interactively
-        if [ "$enable_pubkey_auth" = true ] || [ "$disable_password_auth" = true ]; then
-            
-            if [ "$enable_pubkey_auth" = true ]; then
-                ssh -t "$remote_user@$remote_host" -p "$remote_port" "sudo sed -i.bak 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config"
+        # Refuse to disable password auth unless key authentication is proven to
+        # work with the key we actually just deployed. The old code built the
+        # key path by concatenating the key directory onto an already-absolute
+        # path, so this safety check ran against a file that never existed.
+        if [ "$disable_password_auth" = true ]; then
+            if [ -z "$key_path" ] || [ ! -f "${key_path%.pub}" ]; then
+                error "No usable private key was supplied; NOT disabling password authentication."
+                disable_password_auth=false
+            elif ! test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "${key_path%.pub}"; then
+                error "Key authentication test failed. NOT disabling password authentication for safety."
+                disable_password_auth=false
             fi
-            
-            if [ "$disable_password_auth" = true ]; then
-                # Test key authentication first
-                if test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "$ssh_keys_location$(ls -t $ssh_keys_location/id_* | head -1)"; then
-                    ssh -t "$remote_user@$remote_host" -p "$remote_port" "sudo sed -i.bak 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
-                else
-                    error "Key authentication test failed. NOT disabling password authentication for safety."
-                    disable_password_auth=false
-                fi
-            fi
-            
-            # Restart SSH service
-            ssh -t "$remote_user@$remote_host" -p "$remote_port" "sudo systemctl restart sshd.service || sudo service ssh restart || sudo service sshd restart"
         fi
 
-        success "Remote SSH configuration completed for $remote_host."
-        audit_log "Configured remote SSH for $remote_user@$remote_host:$remote_port"
+        # Now, perform sudo operations interactively
+        if [ "$enable_pubkey_auth" = true ] || [ "$disable_password_auth" = true ]; then
+            local directives=""
+            [ "$enable_pubkey_auth" = true ]    && directives+="PubkeyAuthentication yes"$'\n'
+            [ "$disable_password_auth" = true ] && directives+="PasswordAuthentication no"$'\n'
+
+            info "Applying sshd configuration on $remote_host (sudo may prompt)..."
+            if ssh -t "$remote_user@$remote_host" -p "$remote_port" \
+                "REMOTE_DIRECTIVES=$(printf '%q' "$directives") sudo -p 'sudo password for %u@%h: ' bash -s" <<'REMOTE_EOF'
+set -u
+main_cfg=/etc/ssh/sshd_config
+dropin_dir=/etc/ssh/sshd_config.d
+stamp=$(date +%Y%m%d_%H%M%S)
+
+# Prefer a drop-in, but only if the main config actually Includes it; otherwise
+# the file would be written and silently ignored.
+if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$main_cfg" 2>/dev/null; then
+    mkdir -p "$dropin_dir"
+    target="$dropin_dir/99-sshkeymanager.conf"
+    printf '# Managed by sshkeymanager (%s)\n%s' "$stamp" "$REMOTE_DIRECTIVES" > "$target"
+    chmod 644 "$target"
+    echo "Wrote $target"
+else
+    cp -a "$main_cfg" "${main_cfg}.bak.${stamp}"
+    target="$main_cfg"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        key=${line%% *}
+        # Comment out any existing setting for this key, then append ours, so
+        # that a directive absent from the file is still applied.
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*(${key})[[:space:]]+.*|# (replaced by sshkeymanager) &|I" "$main_cfg"
+        printf '%s\n' "$line" >> "$main_cfg"
+    done <<< "$REMOTE_DIRECTIVES"
+    echo "Updated $main_cfg (backup: ${main_cfg}.bak.${stamp})"
+fi
+
+# Never restart a daemon whose config does not parse.
+if ! sshd -t 2>/dev/null && ! /usr/sbin/sshd -t 2>/dev/null; then
+    echo "ERROR: sshd rejected the new configuration; not restarting." >&2
+    exit 1
+fi
+
+systemctl restart sshd.service 2>/dev/null \
+    || systemctl restart ssh.service 2>/dev/null \
+    || service sshd restart 2>/dev/null \
+    || service ssh restart 2>/dev/null \
+    || { echo "ERROR: could not restart the ssh service." >&2; exit 1; }
+echo "sshd reloaded."
+REMOTE_EOF
+            then
+                success "Remote SSH configuration completed for $remote_host."
+                audit_log "Configured remote SSH for $remote_user@$remote_host:$remote_port"
+            else
+                error "Remote SSH configuration failed on $remote_host. Existing settings were left in place."
+                audit_log "FAILED remote SSH configuration for $remote_user@$remote_host:$remote_port"
+                return 1
+            fi
+        else
+            success "Remote permissions updated for $remote_host."
+            audit_log "Updated remote ~/.ssh permissions for $remote_user@$remote_host:$remote_port"
+        fi
     fi
 }
 
@@ -1145,15 +1427,28 @@ configure_local_ssh() {
     info "Configuring local SSH to use the key: $key_name"
 
     # Set correct permissions for the private key file
-    chmod 600 "$ssh_keys_location$key_name"
+    chmod 600 "$ssh_keys_location/$key_name"
     # Set correct permissions for the public key file
-    chmod 644 "$ssh_keys_location$key_name.pub" 2>/dev/null || true
+    chmod 644 "$ssh_keys_location/$key_name.pub" 2>/dev/null || true
 
     cleanup_and_update_ssh_config 
 
     info "SSH configuration complete."
 }
 
+# Normalize ~/.ssh/config.
+#
+# Runs automatically from the main menu loop, so it must be conservative:
+#   * a timestamped backup is taken once per session, before the first write;
+#   * the file is only rewritten when the result actually differs, so opening
+#     the menu repeatedly no longer churns the config;
+#   * dry-run mode reports what would change and writes nothing.
+#
+# The `Host *` block deliberately carries no IdentityFile entries. Listing every
+# key globally alongside `IdentitiesOnly yes` makes ssh offer all of them on
+# every connection, which trips the server's MaxAuthTries (commonly 6) and locks
+# you out of hosts that previously worked. Keys belong in their own Host blocks,
+# which is what configure_per_host_ssh() writes.
 cleanup_and_update_ssh_config() {
     local ssh_config="$ssh_keys_location/config"
 
@@ -1163,65 +1458,92 @@ cleanup_and_update_ssh_config() {
         exit 1
     fi
 
-    info "Updating SSH config..."
-
     # Ensure the .ssh directory exists with correct permissions
     mkdir -p "$ssh_keys_location"
     chmod 700 "$ssh_keys_location"
 
-    # Generate public keys for all private keys that don't have them
-    find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | while read -r key_file; do
+    # Generate public keys for private keys that lack them.
+    local key_file
+    while IFS= read -r key_file; do
         if [ ! -f "${key_file}.pub" ]; then
+            if [ "$dry_run" = true ]; then
+                info "Would generate public key for $key_file"
+                continue
+            fi
             info "Generating public key for $key_file..."
             if ssh-keygen -y -f "$key_file" > "${key_file}.pub" 2>/dev/null; then
                 chmod 644 "${key_file}.pub"
                 success "Public key generated: ${key_file}.pub"
             else
-                warn "Could not generate public key for $key_file (might be encrypted)"
+                rm -f "${key_file}.pub"
+                warn "Could not generate public key for $key_file (it may be passphrase-protected)"
             fi
         fi
-    done
+    done < <(find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' 2>/dev/null)
 
-    # Create a temporary file
-    local temp_config=$(mktemp)
+    local temp_config
+    temp_config=$(make_temp) || { error "Could not create a temporary file."; return 1; }
 
-    # First, copy any existing host-specific configurations
+    # Preserve everything except the managed Host * block.
     if [[ -f "$ssh_config" ]]; then
-        # Copy everything except the Host * block
         awk '
-            /^Host \*/ { in_host_star = 1; next }
-            /^Host / && in_host_star { in_host_star = 0 }
+            /^[[:space:]]*Host[[:space:]]+\*[[:space:]]*$/ { in_host_star = 1; next }
+            /^[[:space:]]*Host[[:space:]]/ && in_host_star  { in_host_star = 0 }
             !in_host_star { print }
         ' "$ssh_config" > "$temp_config"
+        # Collapse any trailing blank lines left behind by the removal.
+        printf '%s\n' "$(cat "$temp_config")" > "$temp_config"
     fi
 
-    # Now add the Host * block with all identity files
-    echo -e "\nHost *" >> "$temp_config"
+    cat >> "$temp_config" << 'EOF'
 
-    # Array to store unique IdentityFile entries
-    declare -A identity_files
-
-    # Add all private key files as IdentityFile entries
-    find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' | sort | while read -r key_file; do
-        echo "    IdentityFile $key_file" >> "$temp_config"
-    done
-
-    # Add some useful default options
-    cat >> "$temp_config" << EOF
+Host *
     AddKeysToAgent yes
-    IdentitiesOnly yes
     HashKnownHosts yes
     GSSAPIAuthentication no
     ServerAliveInterval 60
     ServerAliveCountMax 3
 EOF
 
-    # Replace the original file with the updated version
-    mv "$temp_config" "$ssh_config"
+    # No-op detection: if nothing would change, leave the file alone entirely.
+    if [ -f "$ssh_config" ] && cmp -s "$temp_config" "$ssh_config"; then
+        rm -f "$temp_config"
+        debug "SSH config already normalized; left untouched."
+        return 0
+    fi
+
+    if [ "$dry_run" = true ]; then
+        info "Would update $ssh_config:"
+        if command -v diff >/dev/null 2>&1 && [ -f "$ssh_config" ]; then
+            diff -u "$ssh_config" "$temp_config" || true
+        fi
+        rm -f "$temp_config"
+        return 0
+    fi
+
+    # Back up once per session, before the first modification.
+    if [ -f "$ssh_config" ] && [ "$ssh_config_backed_up" = false ]; then
+        local backup
+        backup="${ssh_config}.bak.$(date +%Y%m%d_%H%M%S)"
+        if cp -a "$ssh_config" "$backup"; then
+            chmod 600 "$backup"
+            ssh_config_backed_up=true
+            info "Backed up existing SSH config to $backup"
+            audit_log "Backed up $ssh_config to $backup"
+        else
+            error "Could not back up $ssh_config; refusing to modify it."
+            rm -f "$temp_config"
+            return 1
+        fi
+    fi
+
+    info "Updating SSH config..."
+    cat "$temp_config" > "$ssh_config"
+    rm -f "$temp_config"
     chmod 600 "$ssh_config"
 
     info "SSH configuration update complete."
-    results[9]="PASS"
+    audit_log "Normalized $ssh_config"
 }
 
 check_remote_ssh_config() {
@@ -1252,7 +1574,9 @@ check_remote_ssh_config() {
         echo "Checking authorized_keys permissions..."
         ls -l ~/.ssh/authorized_keys
         echo "Number of authorized keys:"
-        grep -c "^ssh-\|^ecdsa-" ~/.ssh/authorized_keys || echo "0"
+        # Count non-comment, non-blank entries. Matching only "^ssh-|^ecdsa-"
+        # missed sk- key types and every line carrying options.
+        grep -cvE "^[[:space:]]*(#|$)" ~/.ssh/authorized_keys || echo "0"
     else
         echo "No authorized_keys file found"
     fi
@@ -1271,7 +1595,7 @@ check_local_ssh_security() {
     # Define checks
     checks=(
         "SSH key permissions"
-        "~/.ssh directory permissions"
+        "SSH key directory permissions"
         "authorized_keys file permissions"
         "Password authentication"
         "Root login"
@@ -1286,7 +1610,7 @@ check_local_ssh_security() {
     
     # Initialize results array
     for ((i=0; i<${#checks[@]}; i++)); do
-        results[$i]=""
+        results[i]=""
     done
     
     # Display checks and ask for confirmation
@@ -1313,7 +1637,11 @@ check_local_ssh_security() {
     check_x11_forwarding
     check_max_auth_tries
     check_ssh_agent_status
-    cleanup_and_update_ssh_config
+    if cleanup_and_update_ssh_config; then
+        results[9]="PASS"
+    else
+        results[9]="Could not normalize $ssh_keys_location/config."
+    fi
     check_known_hosts_integrity
     check_weak_keys
     
@@ -1338,35 +1666,77 @@ check_local_ssh_security() {
     fi
 }
 
-# Helper functions for individual checks
-check_ssh_key_permissions() {
-    local issue=""
-    find "$ssh_keys_location" -type f -name 'id_*' 2>/dev/null | while read key_file; do
-        if [[ "$key_file" == *.pub ]]; then
-            if [[ $(stat -c %a "$key_file" 2>/dev/null || stat -f %p "$key_file" 2>/dev/null | cut -c4-6) != "644" ]]; then
-                issue+="Public key file $key_file has incorrect permissions. "
-            fi
-        else
-            if [[ $(stat -c %a "$key_file" 2>/dev/null || stat -f %p "$key_file" 2>/dev/null | cut -c4-6) != "600" ]]; then
-                issue+="Private key file $key_file has incorrect permissions. "
+# --- Helper functions for individual checks ----------------------------------
+#
+# Each writes its verdict into results[N] in the caller's scope: "PASS", or a
+# human-readable description of the problem.
+
+# Read the *effective* sshd setting for a directive.
+#
+# Modern distributions ship `Include /etc/ssh/sshd_config.d/*.conf`, so grepping
+# the main file alone reports settings that the daemon is not actually using.
+# `sshd -T` resolves the full configuration; the grep is only a fallback for
+# systems where sshd is absent or refuses to dump.
+sshd_effective() {
+    local directive="$1" out
+    local -a sshd_bin=(sshd /usr/sbin/sshd /usr/local/sbin/sshd)
+    local bin
+    for bin in "${sshd_bin[@]}"; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            if out=$("$bin" -T 2>/dev/null); then
+                printf '%s\n' "$out" | awk -v d="$(printf '%s' "$directive" | tr '[:upper:]' '[:lower:]')" \
+                    'tolower($1) == d { $1=""; sub(/^ /,""); print; found=1 } END { exit !found }' && return 0
             fi
         fi
     done
+    # Fallback: last matching uncommented directive in the main config wins here
+    # only as an approximation.
+    if [ -f "$sshd_config" ]; then
+        grep -iE "^[[:space:]]*${directive}[[:space:]]+" "$sshd_config" 2>/dev/null \
+            | tail -1 | awk '{ $1=""; sub(/^ /,""); print }' | grep . && return 0
+    fi
+    return 1
+}
+
+# stat(1) is not portable between GNU and BSD; the original chained them with
+# `||` inside a pipeline, which silently produced the wrong field on macOS.
+file_mode() {
+    local target="$1"
+    stat -c '%a' "$target" 2>/dev/null && return 0
+    stat -f '%OLp' "$target" 2>/dev/null && return 0
+    return 1
+}
+
+check_ssh_key_permissions() {
+    local issue="" key_file mode
+    # Process substitution, not a pipeline: a `find | while` loop runs the body
+    # in a subshell, so every finding accumulated here used to be discarded and
+    # this check always reported PASS.
+    while IFS= read -r key_file; do
+        mode=$(file_mode "$key_file") || continue
+        if [[ "$key_file" == *.pub ]]; then
+            [[ "$mode" == "644" ]] || issue+="Public key $key_file has mode $mode (expected 644). "
+        else
+            [[ "$mode" == "600" ]] || issue+="Private key $key_file has mode $mode (expected 600). "
+        fi
+    done < <(find "$ssh_keys_location" -type f -name 'id_*' 2>/dev/null)
     results[0]=${issue:-"PASS"}
 }
 
 check_ssh_dir_permissions() {
-    local perms=$(stat -c %a "$ssh_keys_location" 2>/dev/null || stat -f %p "$ssh_keys_location" 2>/dev/null | cut -c4-6)
+    local perms
+    perms=$(file_mode "$ssh_keys_location") || { results[1]="Could not stat $ssh_keys_location."; return; }
     if [[ "$perms" != "700" ]]; then
-        results[1]="~/.ssh directory has incorrect permissions ($perms instead of 700)."
+        results[1]="$ssh_keys_location has incorrect permissions ($perms instead of 700)."
     else
         results[1]="PASS"
     fi
 }
 
 check_authorized_keys_permissions() {
-    if [[ -f "$ssh_keys_location/authorized_keys" ]]; then
-        local perms=$(stat -c %a "$ssh_keys_location/authorized_keys" 2>/dev/null || stat -f %p "$ssh_keys_location/authorized_keys" 2>/dev/null | cut -c4-6)
+    local ak="$ssh_keys_location/authorized_keys" perms
+    if [[ -f "$ak" ]]; then
+        perms=$(file_mode "$ak") || { results[2]="Could not stat $ak."; return; }
         if [[ "$perms" != "600" ]]; then
             results[2]="authorized_keys file has incorrect permissions ($perms instead of 600)."
         else
@@ -1378,40 +1748,58 @@ check_authorized_keys_permissions() {
 }
 
 check_password_authentication() {
-    if [ -f "$sshd_config" ] && grep -q "^PasswordAuthentication yes" "$sshd_config"; then
-        results[3]="Password authentication is enabled."
+    local v
+    if v=$(sshd_effective PasswordAuthentication); then
+        if [[ "$v" == "yes" ]]; then
+            results[3]="Password authentication is enabled."
+        else
+            results[3]="PASS"
+        fi
     else
         results[3]="PASS"
     fi
 }
 
 check_root_login() {
-    if [ -f "$sshd_config" ] && grep -q "^PermitRootLogin yes" "$sshd_config"; then
-        results[4]="Root login is permitted."
+    local v
+    if v=$(sshd_effective PermitRootLogin); then
+        case "$v" in
+            yes) results[4]="Root login is permitted." ;;
+            *)   results[4]="PASS" ;;
+        esac
     else
         results[4]="PASS"
     fi
 }
 
 check_ssh_protocol() {
-    # Modern SSH doesn't use Protocol directive anymore
+    # SSH-1 has been gone since OpenSSH 7.4; the Protocol directive no longer
+    # exists. Nothing to assert.
     results[5]="PASS"
 }
 
 check_x11_forwarding() {
-    if [ -f "$sshd_config" ] && grep -q "^X11Forwarding yes" "$sshd_config"; then
-        results[6]="X11 forwarding is enabled."
+    local v
+    if v=$(sshd_effective X11Forwarding); then
+        if [[ "$v" == "yes" ]]; then
+            results[6]="X11 forwarding is enabled."
+        else
+            results[6]="PASS"
+        fi
     else
         results[6]="PASS"
     fi
 }
 
 check_max_auth_tries() {
-    if [ -f "$sshd_config" ]; then
-        if ! grep -q "^MaxAuthTries [1-5]$" "$sshd_config"; then
-            results[7]="MaxAuthTries is not set to a low value (recommended: 3-5)."
-        else
+    local v
+    if v=$(sshd_effective MaxAuthTries); then
+        # Numeric comparison; the old `grep '^MaxAuthTries [1-5]$'` missed
+        # trailing whitespace, leading indentation and drop-in overrides.
+        if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -le 5 ]; then
             results[7]="PASS"
+        else
+            results[7]="MaxAuthTries is $v (recommended: 3-5)."
         fi
     else
         results[7]="PASS"
@@ -1419,7 +1807,7 @@ check_max_auth_tries() {
 }
 
 check_ssh_agent_status() {
-    if [ -z "$SSH_AUTH_SOCK" ]; then
+    if [ -z "${SSH_AUTH_SOCK:-}" ]; then
         results[8]="SSH agent is not running"
     else
         results[8]="PASS"
@@ -1427,10 +1815,15 @@ check_ssh_agent_status() {
 }
 
 check_known_hosts_integrity() {
+    local perms
     if [ -f "$known_hosts_file" ]; then
-        local line_count=$(wc -l < "$known_hosts_file")
-        if [ "$line_count" -eq 0 ]; then
+        if [ ! -s "$known_hosts_file" ]; then
             results[10]="Known hosts file is empty"
+            return
+        fi
+        perms=$(file_mode "$known_hosts_file") || perms=""
+        if [ -n "$perms" ] && [ "$perms" != "600" ] && [ "$perms" != "644" ]; then
+            results[10]="known_hosts has unusual permissions ($perms)."
         else
             results[10]="PASS"
         fi
@@ -1440,69 +1833,132 @@ check_known_hosts_integrity() {
 }
 
 check_weak_keys() {
-    local weak_keys=""
-    
-    find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' 2>/dev/null | while read -r key_file; do
-        local key_info=$(ssh-keygen -lf "${key_file}.pub" 2>/dev/null || echo "")
-        if [[ "$key_info" =~ "1024 bit RSA" ]] || [[ "$key_info" =~ "DSA" ]]; then
-            weak_keys+="Weak key found: $key_file "
-        fi
-    done
-    
+    local weak_keys="" key_file key_info bits type
+    # Same subshell trap as check_ssh_key_permissions: this used to always PASS.
+    while IFS= read -r key_file; do
+        [ -f "${key_file}.pub" ] || continue
+        key_info=$(ssh-keygen -lf "${key_file}.pub" 2>/dev/null) || continue
+        bits=$(printf '%s' "$key_info" | awk '{print $1}')
+        type=$(printf '%s' "$key_info" | awk '{print $NF}' | tr -d '()')
+        case "$type" in
+            DSA)
+                weak_keys+="$key_file is a DSA key (deprecated). " ;;
+            RSA)
+                [[ "$bits" =~ ^[0-9]+$ ]] && [ "$bits" -lt 2048 ] \
+                    && weak_keys+="$key_file is a ${bits}-bit RSA key (minimum 2048). " ;;
+        esac
+    done < <(find "$ssh_keys_location" -type f -name 'id_*' ! -name '*.pub' 2>/dev/null)
     results[11]=${weak_keys:-"PASS"}
 }
 
 fix_local_ssh_security() {
     info "Fixing local SSH security settings..."
-    
-    # Fix SSH key permissions
-    find "$ssh_keys_location" -type f -name 'id_*' 2>/dev/null | while read key_file; do
+
+    local key_file
+    while IFS= read -r key_file; do
         if [[ "$key_file" == *.pub ]]; then
             chmod 644 "$key_file"
         else
             chmod 600 "$key_file"
         fi
-    done
+    done < <(find "$ssh_keys_location" -type f -name 'id_*' 2>/dev/null)
 
-    # Fix directory permissions
     chmod 700 "$ssh_keys_location"
 
-    # Fix authorized_keys permissions
     if [[ -f "$ssh_keys_location/authorized_keys" ]]; then
         chmod 600 "$ssh_keys_location/authorized_keys"
     fi
-    
-    # Fix SSH daemon configuration if we have sudo access
-    if [ -f "$sshd_config" ] && sudo -n test 2>/dev/null; then
-        sudo sed -i.bak 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' "$sshd_config"
-        sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' "$sshd_config"
-        sudo sed -i 's/^#*X11Forwarding.*/X11Forwarding no/' "$sshd_config"
-        sudo sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' "$sshd_config"
-        
-        # Add if not present
-        sudo grep -q "^MaxAuthTries" "$sshd_config" || echo "MaxAuthTries 3" | sudo tee -a "$sshd_config" > /dev/null
-        
-        success "Local SSH security settings have been updated."
-        info "Restarting SSH service..."
-        sudo systemctl restart sshd.service || sudo service ssh restart || sudo service sshd restart
-    else
-        warn "Cannot modify SSH daemon configuration without sudo access."
-    fi
-    
+
     # Start SSH agent if not running
-    if [ -z "$SSH_AUTH_SOCK" ]; then
-        eval "$(ssh-agent -s)"
+    if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+        eval "$(ssh-agent -s)" >/dev/null
         info "SSH agent started."
     fi
-    
-    # Create known_hosts if it doesn't exist
+
+    # known_hosts is 600, not 644: it records every host you connect to, which
+    # is not something to hand to other local users.
     if [ ! -f "$known_hosts_file" ]; then
         touch "$known_hosts_file"
-        chmod 644 "$known_hosts_file"
     fi
-    
-    audit_log "Fixed local SSH security settings"
-    success "Security fixes applied where possible."
+    chmod 600 "$known_hosts_file"
+
+    success "File permissions and agent state corrected."
+
+    # --- sshd hardening ------------------------------------------------------
+    #
+    # This is the part that can lock you out of your own machine, so it is opt
+    # in and it verifies key authentication first. The previous implementation
+    # gated the whole block behind `sudo -n test`, and `test` with no arguments
+    # always exits 1, so none of it ever ran.
+    if [ ! -f "$sshd_config" ]; then
+        info "No local sshd configuration at $sshd_config; skipping daemon hardening."
+        audit_log "Fixed local SSH permissions (no sshd present)"
+        return 0
+    fi
+
+    echo
+    warn "The remaining fixes change this machine's SSH *server* configuration."
+    warn "Disabling password authentication while key authentication is not working"
+    warn "will lock you out of any remote session to this host."
+    if ! prompt_yes_no "Harden the local sshd configuration?" "n"; then
+        info "Skipped sshd changes."
+        audit_log "Fixed local SSH permissions (sshd hardening declined)"
+        return 0
+    fi
+
+    if ! sudo -v 2>/dev/null; then
+        warn "Cannot modify sshd configuration without sudo access."
+        return 1
+    fi
+
+    local -a directives=("PermitRootLogin no" "X11Forwarding no" "MaxAuthTries 3")
+    if prompt_yes_no "Also disable password authentication? (only if key login already works)" "n"; then
+        directives+=("PasswordAuthentication no")
+    fi
+
+    local stamp target
+    stamp=$(date +%Y%m%d_%H%M%S)
+
+    if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$sshd_config" 2>/dev/null; then
+        target="/etc/ssh/sshd_config.d/99-sshkeymanager.conf"
+        sudo mkdir -p /etc/ssh/sshd_config.d
+        printf '# Managed by sshkeymanager (%s)\n%s\n' "$stamp" "$(printf '%s\n' "${directives[@]}")" \
+            | sudo tee "$target" >/dev/null
+        sudo chmod 644 "$target"
+        info "Wrote $target"
+    else
+        sudo cp -a "$sshd_config" "${sshd_config}.bak.${stamp}"
+        target="$sshd_config"
+        local d key
+        for d in "${directives[@]}"; do
+            key=${d%% *}
+            # Comment out any existing setting, then append. A plain sed
+            # substitution silently does nothing when the directive is absent.
+            sudo sed -i -E "s|^[[:space:]]*#?[[:space:]]*(${key})[[:space:]]+.*|# (replaced by sshkeymanager) &|I" "$sshd_config"
+            printf '%s\n' "$d" | sudo tee -a "$sshd_config" >/dev/null
+        done
+        info "Updated $sshd_config (backup: ${sshd_config}.bak.${stamp})"
+    fi
+
+    # Never restart a daemon whose configuration does not parse.
+    if ! sudo sshd -t 2>/dev/null && ! sudo /usr/sbin/sshd -t 2>/dev/null; then
+        error "sshd rejected the new configuration. Reverting is up to you:"
+        error "  backup/drop-in written at: $target"
+        audit_log "sshd config rejected after local hardening attempt"
+        return 1
+    fi
+
+    info "Restarting SSH service..."
+    if sudo systemctl restart sshd.service 2>/dev/null \
+        || sudo systemctl restart ssh.service 2>/dev/null \
+        || sudo service sshd restart 2>/dev/null \
+        || sudo service ssh restart 2>/dev/null; then
+        success "Local SSH daemon configuration updated and reloaded."
+        audit_log "Hardened local sshd configuration"
+    else
+        warn "Configuration written, but the SSH service could not be restarted."
+        audit_log "Hardened local sshd configuration (restart failed)"
+    fi
 }
 
 display_main_menu() {
@@ -1567,7 +2023,10 @@ display_ssh_agent_menu() {
         echo -e "${YELLOW}q. Return to main menu${NC}"
         echo ""
         
-        read -p "$(echo -e "${BLUE}Choose an option: ${NC}")" agent_option
+        if ! read -rp "$(echo -e "${BLUE}Choose an option: ${NC}")" agent_option; then
+            echo ""
+            return
+        fi
         
         case "$agent_option" in
             1)
@@ -1575,15 +2034,16 @@ display_ssh_agent_menu() {
                 ssh-add -l || echo "No keys loaded."
                 ;;
             2)
-                local key_to_add=$(select_key_file "private key to add" "$ssh_keys_location/id_rsa" "id_*" "false")
-                if [ $? -eq 0 ]; then
+                local key_to_add
+                if key_to_add=$(select_key_file "private key to add" "$ssh_keys_location/id_rsa" "id_*" "false"); then
                     add_key_to_agent "$key_to_add"
                 fi
                 ;;
             3)
                 info "Select key to remove:"
                 ssh-add -l
-                local key_to_remove=$(prompt_with_default "Enter path to key to remove" "")
+                local key_to_remove
+                key_to_remove=$(prompt_with_default "Enter path to key to remove" "")
                 if [ -n "$key_to_remove" ]; then
                     ssh-add -d "$key_to_remove"
                 fi
@@ -1611,7 +2071,7 @@ display_ssh_agent_menu() {
         esac
         
         echo ""
-        read -p "Press Enter to continue..."
+        read -rp "Press Enter to continue..."
     done
 }
 
@@ -1630,7 +2090,10 @@ display_settings_menu() {
         echo -e "${YELLOW}q. Return to main menu${NC}"
         echo ""
 
-        read -p "$(echo -e "${BLUE}Choose an option: ${NC}")" settings_option
+        if ! read -rp "$(echo -e "${BLUE}Choose an option: ${NC}")" settings_option; then
+            echo ""
+            return
+        fi
         
         case "$settings_option" in
             1)
@@ -1678,7 +2141,7 @@ manage_ssh_config_hosts() {
     echo -e "${BLUE}════════════════════════${NC}"
     
     # Extract and display hosts
-    grep "^Host " "$ssh_config" | grep -v "Host \*" | awk '{print NR ". " $2}'
+    list_config_hosts | awk '{print NR ". " $0}'
     
     echo -e "\n${CYAN}Options:${NC}"
     echo "1. Add new host"
@@ -1686,15 +2149,26 @@ manage_ssh_config_hosts() {
     echo "3. Remove host"
     echo "4. View full config"
     
-    read -p "Choose an option: " config_option
+    read -rp "Choose an option: " config_option
     
     case "$config_option" in
         1)
-            local new_host=$(prompt_with_default "Enter hostname" "")
-            local new_user=$(prompt_with_default "Enter username" "$USER")
-            local new_port=$(prompt_with_default "Enter port" "22")
-            local key_path=$(select_key_file "private key for this host" "$ssh_keys_location/id_rsa" "id_*" "false")
-            
+            local new_host
+            new_host=$(prompt_with_default "Enter hostname" "")
+            local new_user
+            new_user=$(prompt_with_default "Enter username" "$default_remote_user")
+            local new_port
+            new_port=$(prompt_with_default "Enter port" "22")
+            local key_path
+            if [ -z "$new_host" ]; then
+                error "A hostname is required."
+                return 1
+            fi
+            if ! key_path=$(select_key_file "private key for this host" "$ssh_keys_location/id_rsa" "id_*" "false"); then
+                error "No key selected; host not added."
+                return 1
+            fi
+
             configure_per_host_ssh "$new_host" "$new_user" "$new_port" "$key_path"
             ;;
         2)
@@ -1704,20 +2178,28 @@ manage_ssh_config_hosts() {
             ;;
         3)
             # Remove host
-            local host_to_remove=$(prompt_with_default "Enter host to remove" "")
-            if [ -n "$host_to_remove" ]; then
-                # Create backup
-                cp "$ssh_config" "${ssh_config}.bak"
-                # Remove host block
-                awk -v host="$host_to_remove" '
-                    /^Host / && $2 == host { skip = 1; next }
-                    /^Host / && skip { skip = 0 }
-                    !skip { print }
-                ' "$ssh_config" > "${ssh_config}.tmp"
-                mv "${ssh_config}.tmp" "$ssh_config"
-                chmod 600 "$ssh_config"
-                success "Host $host_to_remove removed."
+            local host_to_remove
+            host_to_remove=$(prompt_with_default "Enter host to remove" "")
+            if [ -z "$host_to_remove" ]; then
+                error "No host given."
+                return 1
             fi
+            if ! config_has_host "$ssh_config" "$host_to_remove"; then
+                error "Host '$host_to_remove' is not declared in $ssh_config."
+                return 1
+            fi
+            # Timestamped so a second removal cannot overwrite the only backup.
+            local ak_backup
+            ak_backup="${ssh_config}.bak.$(date +%Y%m%d_%H%M%S)"
+            cp -a "$ssh_config" "$ak_backup" && chmod 600 "$ak_backup"
+            local removed
+            removed=$(make_temp) || { error "Could not create a temporary file."; return 1; }
+            remove_host_block "$ssh_config" "$host_to_remove" > "$removed"
+            cat "$removed" > "$ssh_config"
+            rm -f "$removed"
+            chmod 600 "$ssh_config"
+            success "Host $host_to_remove removed (backup: $ak_backup)."
+            audit_log "Removed host $host_to_remove from $ssh_config"
             ;;
         4)
             less "$ssh_config"
@@ -1750,23 +2232,34 @@ test_connections_menu() {
     echo "1. Test specific connection"
     echo "2. Test all configured hosts"
     
-    read -p "Choose an option: " test_option
+    read -rp "Choose an option: " test_option
     
     case "$test_option" in
         1)
-            read remote_host remote_user remote_port <<< $(prompt_remote_details)
-            local key_path=$(select_key_file "private key to test" "$ssh_keys_location/id_rsa" "id_*" "false")
-            test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "$key_path"
+            prompt_remote_details || return 0
+            local key_path
+            if ! key_path=$(select_key_file "private key to test" "$ssh_keys_location/id_rsa" "id_*" "false"); then
+                error "No key selected."
+                return 1
+            fi
+            test_ssh_connection "$remote_user" "$remote_host" "$remote_port" "$key_path" || true
             ;;
         2)
             local ssh_config="$ssh_keys_location/config"
             if [ -f "$ssh_config" ]; then
-                local hosts=($(grep "^Host " "$ssh_config" | grep -v "Host \*" | awk '{print $2}'))
+                local hosts=()
+                mapfile -t hosts < <(list_config_hosts)
+                if [ ${#hosts[@]} -eq 0 ]; then
+                    warn "No concrete hosts are configured."
+                    return 0
+                fi
                 for host in "${hosts[@]}"; do
                     info "Testing connection to $host..."
-                    ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "echo 'Connection successful'" 2>/dev/null \
-                        && success "$host: OK" \
-                        || error "$host: FAILED"
+                    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "echo 'Connection successful'" >/dev/null 2>&1; then
+                        success "$host: OK"
+                    else
+                        error "$host: FAILED"
+                    fi
                 done
             else
                 warn "No SSH config file found."
@@ -1787,7 +2280,7 @@ display_global_variables_menu() {
         echo -e "${CYAN}3. Agnostic authorized keys${NC}"
         echo "   CURRENT: $agnostic_authorized_keys"
         echo -e "${CYAN}4. Backup directory${NC}"
-        echo "   CURRENT: $backup_dir"
+        echo "   CURRENT: $backup_root"
         echo -e "${CYAN}5. Default SSH Port${NC}"
         echo "   CURRENT: $default_ssh_port"
         echo -e "${CYAN}6. Audit log location${NC}"
@@ -1796,20 +2289,27 @@ display_global_variables_menu() {
         echo -e "${YELLOW}q. Return to Advanced Settings Menu${NC}"
         echo ""
 
-        read -p "$(echo -e "${BLUE}Choose a variable to modify: ${NC}")" var_option
+        if ! read -rp "$(echo -e "${BLUE}Choose a variable to modify: ${NC}")" var_option; then
+            echo ""
+            return
+        fi
         
         case "$var_option" in
             1)
-                read -p "Enter new SSH key location: " new_location
+                read -rp "Enter new SSH key location: " new_location
                 if [ -d "$new_location" ]; then
-                    ssh_keys_location="$new_location"
-                    success "SSH key location updated."
+                    # Normalized so that "$ssh_keys_location/$name" can never
+                    # become a doubled slash, and a value entered without a
+                    # trailing slash can never silently concatenate.
+                    ssh_keys_location=$(normalize_dir "$new_location")
+                    known_hosts_file="$ssh_keys_location/known_hosts"
+                    success "SSH key location updated to $ssh_keys_location."
                 else
                     error "Invalid directory. Please try again."
                 fi
                 ;;
             2)
-                read -p "Enter new SSH daemon config location: " new_sshd_config
+                read -rp "Enter new SSH daemon config location: " new_sshd_config
                 if [ -f "$new_sshd_config" ]; then
                     sshd_config="$new_sshd_config"
                     success "SSH daemon config location updated."
@@ -1826,19 +2326,32 @@ display_global_variables_menu() {
                 success "Agnostic authorized keys setting updated."
                 ;;
             4)
-                read -p "Enter new backup dir pattern: " new_pattern
-                backup_dir="$new_pattern"
-                success "Backup dir pattern updated."
+                read -rp "Enter new backup directory: " new_pattern
+                if [ -n "$new_pattern" ]; then
+                    backup_root=$(normalize_dir "$new_pattern")
+                    backup_dir="$backup_root/ssh_backup_$(date +%Y%m%d_%H%M%S)"
+                    success "Backup directory updated to $backup_root."
+                else
+                    error "Backup directory cannot be empty."
+                fi
                 ;;
             5)
-                read -p "Enter new default SSH Port: " new_port
-                default_ssh_port="$new_port"
-                success "Default SSH Port updated."
+                read -rp "Enter new default SSH Port: " new_port
+                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
+                    default_ssh_port="$new_port"
+                    success "Default SSH Port updated."
+                else
+                    error "Port must be a number between 1 and 65535."
+                fi
                 ;;
             6)
-                read -p "Enter new audit log location: " new_audit
-                audit_log="$new_audit"
-                success "Audit log location updated."
+                read -rp "Enter new audit log location: " new_audit
+                if [ -n "$new_audit" ]; then
+                    audit_log="$new_audit"
+                    success "Audit log location updated."
+                else
+                    error "Audit log location cannot be empty."
+                fi
                 ;;
             q|Q)
                 return
@@ -1851,9 +2364,12 @@ display_global_variables_menu() {
 }
 
 backup_ssh_keys() {
-    local default_backup_dir="$backup_dir"
+    # backup_root, not backup_dir: backup_dir already ends in a timestamp, so
+    # using it here produced ~/.sshbackups/ssh_backup_<ts>/ssh_backup_<ts>.
+    local default_backup_dir="$backup_root"
     local chosen_backup_dir
-    local timestamp=$(date +"%Y%m%d_%H%M%S")
+    local timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
 
     echo -e "\n${CYAN}SSH Key Backup${NC}"
     echo -e "${BLUE}═════════════════════════${NC}\n"
@@ -1862,7 +2378,7 @@ backup_ssh_keys() {
     if prompt_yes_no "Use default backup directory?" "y"; then
         chosen_backup_dir="$default_backup_dir"
     else
-        read -p "Enter the desired backup directory path: " chosen_backup_dir
+        read -rp "Enter the desired backup directory path: " chosen_backup_dir
     fi
 
     # Ensure the chosen directory exists
@@ -1873,18 +2389,20 @@ backup_ssh_keys() {
     mkdir -p "$backup_path"
 
     # Copy SSH directory contents to the backup location
-    if cp -R "$ssh_keys_location"* "$backup_path" 2>/dev/null; then
+    if cp -a "$ssh_keys_location/." "$backup_path/" 2>/dev/null; then
         # Set appropriate permissions for the backed-up files
         chmod 700 "$backup_path"
         find "$backup_path" -type f -exec chmod 600 {} \;
         find "$backup_path" -name "*.pub" -type f -exec chmod 644 {} \;
 
         # Create a manifest file
-        echo "SSH Keys Backup Manifest" > "$backup_path/MANIFEST.txt"
-        echo "Backup Date: $(date)" >> "$backup_path/MANIFEST.txt"
-        echo "Source: $ssh_keys_location" >> "$backup_path/MANIFEST.txt"
-        echo -e "\nBackup Contents:" >> "$backup_path/MANIFEST.txt"
-        ls -la "$backup_path" >> "$backup_path/MANIFEST.txt"
+        {
+            echo "SSH Keys Backup Manifest"
+            echo "Backup Date: $(date)"
+            echo "Source: $ssh_keys_location"
+            printf '\nBackup Contents:\n'
+            ls -la "$backup_path"
+        } > "$backup_path/MANIFEST.txt"
 
         success "SSH keys and configurations backed up successfully to: $backup_path"
         audit_log "Created backup in $backup_path"
@@ -1897,11 +2415,20 @@ manipulate_remote_pubkeyfile() {
     local remote_host remote_user remote_port remote_file local_file
 
     # Step 1: Get remote details and download the file
-    read remote_host remote_user remote_port <<< $(prompt_remote_details)
-    remote_file="/home/$remote_user/.ssh/authorized_keys"
-    local_file=$(mktemp)
-    
-    info "Downloading authorized_keys from $remote_host..."
+    prompt_remote_details || return 0
+
+    # Ask the remote host where the account's home actually is. Hardcoding
+    # /home/<user> is wrong for root, for macOS (/Users), and for any account
+    # with a non-default home.
+    if ! remote_file=$(ssh -o BatchMode=no "$remote_user@$remote_host" -p "$remote_port" \
+        'printf "%s/.ssh/authorized_keys" "$HOME"' 2>/dev/null) || [ -z "$remote_file" ]; then
+        warn "Could not determine the remote home directory; falling back to ~/.ssh/authorized_keys."
+        remote_file='.ssh/authorized_keys'
+    fi
+
+    local_file=$(make_temp) || { error "Could not create a temporary file."; return 1; }
+
+    info "Downloading $remote_file from $remote_host..."
     if ! scp -P "$remote_port" "$remote_user@$remote_host:$remote_file" "$local_file" 2>/dev/null; then
         warn "Failed to download the remote file. It might not exist."
         if prompt_yes_no "Create a new authorized_keys file?" "y"; then
@@ -1927,7 +2454,11 @@ manipulate_remote_pubkeyfile() {
         echo -e "  ${YELLOW}Enter${NC} - Save and upload"
         echo -e "  ${YELLOW}q${NC} - Quit without saving"
         
-        read -p "Your choice: " user_input
+        if ! read -rp "Your choice: " user_input; then
+            warn "Input closed; discarding changes."
+            rm -f "$local_file" "${local_file}.backup"
+            return 1
+        fi
 
         case "$user_input" in
             "")
@@ -1995,18 +2526,20 @@ validate_authorized_keys() {
             continue
         fi
         
-        # Create a temporary file with just this key
-        echo "$line" > /tmp/test_key_$$.pub
-        
-        # Try to get fingerprint
-        if ssh-keygen -lf /tmp/test_key_$$.pub >/dev/null 2>&1; then
+        # A predictable path under a world-writable /tmp is a symlink-attack
+        # target; mktemp gives an unpredictable name with safe permissions.
+        local probe
+        probe=$(make_temp) || { error "Could not create a temporary file."; return 1; }
+        printf %s\\n "$line" > "$probe"
+
+        if ssh-keygen -lf "$probe" >/dev/null 2>&1; then
             echo -e "${GREEN}Line $line_num: Valid${NC}"
         else
             echo -e "${RED}Line $line_num: Invalid key format${NC}"
             ((errors++))
         fi
-        
-        rm -f /tmp/test_key_$$.pub
+
+        rm -f "$probe"
         ((line_num++))
     done < "$file"
     
@@ -2019,7 +2552,8 @@ validate_authorized_keys() {
 
 sort_authorized_keys() {
     local file="$1"
-    local temp_file=$(mktemp)
+    local temp_file
+    temp_file=$(make_temp) || { error "Could not create a temporary file."; return 1; }
     
     # Sort by key type, then by the key data
     sort -k1,1 -k2,2 "$file" > "$temp_file"
@@ -2050,7 +2584,8 @@ edit_line() {
         # Extract options (everything before the key type)
         options=$(echo "$current_line" | sed -n 's/^\(.*\)\s\+\(ssh-[^ ]*\|ecdsa-[^ ]*\)\s\+.*/\1/p')
         # Extract the rest
-        local key_part=$(echo "$current_line" | sed -n 's/^.*\(\(ssh-[^ ]*\|ecdsa-[^ ]*\)\s\+.*\)/\1/p')
+        local key_part
+        key_part=$(echo "$current_line" | sed -n 's/^.*\(\(ssh-[^ ]*\|ecdsa-[^ ]*\)\s\+.*\)/\1/p')
         key_type=$(echo "$key_part" | awk '{print $1}')
         key_data=$(echo "$key_part" | awk '{print $2}')
         comment=$(echo "$key_part" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i}' | sed 's/ *$//')
@@ -2070,7 +2605,9 @@ edit_line() {
         echo -e "${YELLOW}5. Manage Options${NC}"
         echo -e "Press Enter to finish editing this line"
 
-        read -p "Select a value to edit (1-5) or press Enter to finish: " value_choice
+        if ! read -rp "Select a value to edit (1-5) or press Enter to finish: " value_choice; then
+            break
+        fi
 
         case $value_choice in
             1)
@@ -2080,7 +2617,7 @@ edit_line() {
                 echo "3. ecdsa-sha2-nistp256"
                 echo "4. ssh-ed25519-sk"
                 echo "5. ecdsa-sha2-nistp256-sk"
-                read -p "Choice: " kt_choice
+                read -rp "Choice: " kt_choice
                 case $kt_choice in
                     1) key_type="ssh-rsa";;
                     2) key_type="ssh-ed25519";;
@@ -2090,13 +2627,13 @@ edit_line() {
                 esac
                 ;;
             2)
-                read -p "Enter new key data: " key_data
+                read -rp "Enter new key data: " key_data
                 ;;
             3)
-                read -p "Enter new comment: " comment
+                read -rp "Enter new comment: " comment
                 ;;
             4)
-                read -p "Enter new options (or press Enter for none): " options
+                read -rp "Enter new options (or press Enter for none): " options
                 ;;
             5)
                 manage_key_options
@@ -2121,8 +2658,19 @@ edit_line() {
             new_line="$new_line $comment"
         fi
         
-        sed -i "${line_number}s|.*|$new_line|" "$file"
-        success "Line updated."
+        # The replacement is passed through the environment rather than
+        # interpolated into a sed script: a key comment containing "|" broke
+        # the old delimiter, and "&" was expanded as a back-reference.
+        local rewritten
+        rewritten=$(make_temp) || { error "Could not create a temporary file."; return 1; }
+        if NEW_LINE="$new_line" awk -v n="$line_number" \
+            'NR == n { print ENVIRON["NEW_LINE"]; next } { print }' "$file" > "$rewritten"; then
+            cat "$rewritten" > "$file"
+            success "Line updated."
+        else
+            error "Failed to rewrite line $line_number."
+        fi
+        rm -f "$rewritten"
     done
 }
 
@@ -2159,7 +2707,7 @@ append_new_line() {
     echo "1. ssh-rsa"
     echo "2. ssh-ed25519"
     echo "3. ecdsa-sha2-nistp256"
-    read -p "Choice: " kt_choice
+    read -rp "Choice: " kt_choice
     
     case $kt_choice in
         1) new_key_type="ssh-rsa";;
@@ -2168,9 +2716,9 @@ append_new_line() {
         *) error "Invalid choice"; return;;
     esac
 
-    read -p "Enter key data: " new_key_data
-    read -p "Enter comment (optional): " new_comment
-    read -p "Enter options (press Enter for none): " new_options
+    read -rp "Enter key data: " new_key_data
+    read -rp "Enter comment (optional): " new_comment
+    read -rp "Enter options (press Enter for none): " new_options
 
     if [ -n "$new_options" ]; then
         echo "$new_options $new_key_type $new_key_data $new_comment" >> "$file"
@@ -2184,14 +2732,21 @@ append_new_line() {
 # Function to toggle SSH key options
 toggle_option() {
     local option="$1"
-    if [[ "$options" == *"$option"* ]]; then
-        options="${options//$option/}"
+    # Match on whole words: "no-port-forwarding" is a substring of nothing else
+    # today, but a plain substring test would mangle any future option that
+    # shares a prefix.
+    if [[ " $options " == *" $option "* ]]; then
+        options=" $options "
+        options="${options// $option / }"
         echo "$option removed."
     else
         options="$option $options"
         echo "$option added."
     fi
-    options=$(echo "$options" | xargs)  # Trim leading/trailing spaces
+    # Collapse whitespace without letting the shell glob or split the value.
+    options=$(printf '%s' "$options" | tr -s '[:space:]' ' ')
+    options="${options#"${options%%[![:space:]]*}"}"
+    options="${options%"${options##*[![:space:]]}"}"
 }
 
 manage_key_options() {
@@ -2219,12 +2774,14 @@ manage_key_options() {
         echo -e "\n${GREEN}Current options:${NC} ${options:-None}"
         
         echo -e "\n${YELLOW}Enter your choice (1-8) or press Enter to finish:${NC}"
-        read -p "" option_choice
+        if ! read -rp "" option_choice; then
+            break
+        fi
 
         case $option_choice in
             1)
-                read -p "Enter command restriction (or press Enter to remove): " cmd
-                options=$(echo "$options" | sed 's/command="[^"]*"//g')
+                read -rp "Enter command restriction (or press Enter to remove): " cmd
+                options=$(printf '%s' "$options" | sed 's/command="[^"]*"//g')
                 [ -n "$cmd" ] && options="command=\"$cmd\" $options"
                 ;;
             2)
@@ -2232,25 +2789,25 @@ manage_key_options() {
                 echo "1. IP address/range"
                 echo "2. Username"
                 echo "3. Hostname"
-                read -p "Choice: " from_type
-                
+                read -rp "Choice: " from_type
+
+                from_value=""
                 case $from_type in
-                    1)
-                        read -p "Enter IP restriction: " from_value
-                        [ -n "$from_value" ] && options="from=\"$from_value\" $options"
-                        ;;
-                    2)
-                        read -p "Enter username: " from_value
-                        [ -n "$from_value" ] && options="from=\"user=$from_value\" $options"
-                        ;;
-                    3)
-                        read -p "Enter hostname pattern: " from_value
-                        [ -n "$from_value" ] && options="from=\"host=$from_value\" $options"
-                        ;;
+                    1) read -rp "Enter IP restriction: " from_value ;;
+                    2) read -rp "Enter username: " from_value
+                       [ -n "$from_value" ] && from_value="user=$from_value" ;;
+                    3) read -rp "Enter hostname pattern: " from_value
+                       [ -n "$from_value" ] && from_value="host=$from_value" ;;
+                    *) error "Invalid choice."; continue ;;
                 esac
+                # sshd accepts only one from= per key; appending a second one
+                # makes the whole entry invalid, so replace any existing value.
+                options=$(printf '%s' "$options" | sed 's/from="[^"]*"//g')
+                [ -n "$from_value" ] && options="from=\"$from_value\" $options"
                 ;;
             3)
-                read -p "Enter environment variable (NAME=value): " env_var
+                read -rp "Enter environment variable (NAME=value): " env_var
+                options=$(printf '%s' "$options" | sed 's/environment="[^"]*"//g')
                 [ -n "$env_var" ] && options="environment=\"$env_var\" $options"
                 ;;
             4)
@@ -2278,7 +2835,9 @@ manage_key_options() {
         esac
         
         # Clean up extra spaces
-        options=$(echo $options | xargs)
+        options=$(printf '%s' "$options" | tr -s '[:space:]' ' ')
+        options="${options#"${options%%[![:space:]]*}"}"
+        options="${options%"${options##*[![:space:]]}"}"
     done
 }
 
@@ -2305,6 +2864,14 @@ display_file_contents() {
     echo -e "${BLUE}═════════════════════════${NC}\n"
 }
 
+# --- Entry point -------------------------------------------------------------
+# Guard the interactive session so the file can be sourced (by tests, or to
+# reuse a single function) without launching the menu.
+# shellcheck disable=SC2317  # reached only when the file is sourced
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+    return 0
+fi
+
 # Initialize audit log if it doesn't exist
 if [ ! -f "$audit_log" ]; then
     touch "$audit_log"
@@ -2330,11 +2897,21 @@ check_ssh_agent
 
 # Main menu loop
 while true; do
-    # Auto-cleanup on each iteration
-    cleanup_and_update_ssh_config >/dev/null 2>&1
+    # Normalize ~/.ssh/config each time round. This is a no-op when the file is
+    # already in shape, backs the file up before its first modification, and is
+    # skipped entirely under --dry-run. Output is no longer discarded, so a
+    # failure here is visible rather than silent.
+    if [ "$dry_run" != true ]; then
+        cleanup_and_update_ssh_config || warn "Could not normalize $ssh_keys_location/config."
+    fi
 
     display_main_menu
-    read -p "$(echo -e "${BLUE}Choose an option (1-7/q): ${NC}")" option
+    if ! read -rp "$(echo -e "${BLUE}Choose an option (1-7/q): ${NC}")" option; then
+        echo ""
+        info "Input closed. Exiting."
+        audit_log "Script exited on EOF"
+        exit 0
+    fi
     echo ""
 
     case "$option" in
@@ -2370,6 +2947,4 @@ while true; do
     esac
 
     echo ""
-    # Optional: pause between operations
-    # read -p "Press Enter to return to the main menu..."
-    done
+done
